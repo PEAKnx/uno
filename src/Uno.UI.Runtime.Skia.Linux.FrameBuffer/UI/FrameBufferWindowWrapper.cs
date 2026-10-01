@@ -27,30 +27,59 @@ internal class FrameBufferWindowWrapper : NativeWindowWrapperBase
 		}
 		_instance = this;
 
-		Orientation = orientation;
+		_orientation = orientation;
 	}
 
-	public DisplayOrientations Orientation { get; }
+	// Read by the render and input threads, changed on the UI thread (SetOrientation)
+	private volatile DisplayOrientations _orientation;
+	private Size? _rawScreenSize;
+
+	public DisplayOrientations Orientation => _orientation;
+
+	/// <summary>
+	/// Changes the display orientation at runtime (UI thread): the window gets the rotated size, so the app lays
+	/// out for it, and rendering and pointer mapping follow the new orientation.
+	/// </summary>
+	internal void SetOrientation(DisplayOrientations orientation)
+	{
+		NativeDispatcher.CheckThreadAccess();
+		if (orientation == _orientation)
+		{
+			return;
+		}
+
+		if (_rawScreenSize is { } rawScreenSize && XamlRoot is { })
+		{
+			ApplySize(rawScreenSize, orientation);
+		}
+		_orientation = orientation;
+	}
 
 	internal void SetSize(Size rawScreenSize)
 	{
+		_rawScreenSize = rawScreenSize;
 		if (XamlRoot is { })
 		{
-			var scale = RasterizationScale = (float)DisplayInformation.GetForCurrentViewSafe().RawPixelsPerViewPixel;
-			if (Orientation is DisplayOrientations.Portrait or DisplayOrientations.PortraitFlipped)
-			{
-				(rawScreenSize.Height, rawScreenSize.Width) = (rawScreenSize.Width, rawScreenSize.Height);
-			}
-			var bounds = new Rect(0, 0, rawScreenSize.Width / scale, rawScreenSize.Height / scale);
-			SetBoundsAndVisibleBounds(bounds, bounds);
-			var fullSize = new SizeInt32((int)rawScreenSize.Width, (int)rawScreenSize.Height);
-			SetSizes(fullSize, fullSize);
-			FrameBufferPointerInputSource.Instance.MousePosition = bounds.GetCenter();
+			ApplySize(rawScreenSize, _orientation);
 		}
 		else
 		{
 			NativeDispatcher.Main.Enqueue(() => SetSize(rawScreenSize));
 		}
+	}
+
+	private void ApplySize(Size rawScreenSize, DisplayOrientations orientation)
+	{
+		var scale = RasterizationScale = (float)DisplayInformation.GetForCurrentViewSafe().RawPixelsPerViewPixel;
+		if (orientation is DisplayOrientations.Portrait or DisplayOrientations.PortraitFlipped)
+		{
+			(rawScreenSize.Height, rawScreenSize.Width) = (rawScreenSize.Width, rawScreenSize.Height);
+		}
+		var bounds = new Rect(0, 0, rawScreenSize.Width / scale, rawScreenSize.Height / scale);
+		SetBoundsAndVisibleBounds(bounds, bounds);
+		var fullSize = new SizeInt32((int)rawScreenSize.Width, (int)rawScreenSize.Height);
+		SetSizes(fullSize, fullSize);
+		FrameBufferPointerInputSource.Instance.MousePosition = bounds.GetCenter();
 	}
 
 	internal void OnNativeVisibilityChanged(bool visible) => IsVisible = visible;

@@ -71,7 +71,7 @@ namespace Uno.UI.Runtime.Skia
 		}
 
 		public DisplayOrientations CurrentOrientation
-			=> DisplayOrientations.Landscape;
+			=> FrameBufferWindowWrapper.Instance.Orientation;
 
 		public uint ScreenHeightInRawPixels
 			=> _details.ScreenHeightInRawPixels;
