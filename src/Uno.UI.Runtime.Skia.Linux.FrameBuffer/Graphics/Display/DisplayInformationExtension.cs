@@ -1,4 +1,5 @@
-﻿using System;
+﻿// Modified by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
+using System;
 using System.Globalization;
 using Windows.Graphics.Display;
 using Microsoft.UI.Windowing;

@@ -1,3 +1,4 @@
+// Added by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;

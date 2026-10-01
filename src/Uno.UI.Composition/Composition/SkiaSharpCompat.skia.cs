@@ -1,3 +1,4 @@
+// Added by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
 // Build compatibility with SkiaSharp 4.x, where the by-value SKPath.Transform and SKCanvas.SetMatrix overloads are
 // obsolete-as-error: the call sites use the `in` overloads.
 namespace Microsoft.UI.Composition
