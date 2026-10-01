@@ -32,6 +32,9 @@ internal abstract class FrameBufferRenderer
 		_cursorVisible = mouseIndicatorOptions.ShowMouseCursor;
 		_receivedMouseEvent = FrameBufferPointerInputSource.Instance.ReceivedMouseEvent;
 		FrameBufferPointerInputSource.Instance.MouseEventReceived += OnMouseEventReceived;
+		// Every frame is redrawn and presented completely (Render passes no previous canvas), so the damage the
+		// render walk would compute is never used
+		Microsoft.UI.Composition.Visual.EnableDamageTracking = false;
 	}
 
 	private void OnMouseEventReceived()
