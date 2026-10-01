@@ -159,7 +159,7 @@ public partial class ShapeVisual
 			var sx = Size.X / viewBox.Size.X;
 			var sy = Size.Y / viewBox.Size.Y;
 			var m = SKMatrix.Concat(SKMatrix.CreateScale(sx, sy), SKMatrix.CreateTranslation(-viewBox.Offset.X, -viewBox.Offset.Y));
-			dst.Transform(m);
+			dst.TransformBy(m);
 		}
 
 		return dst;

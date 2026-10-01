@@ -159,7 +159,7 @@ namespace Microsoft.UI.Composition
 			var m = GetRenderTransform();
 			if (!m.IsIdentity)
 			{
-				shapePath.Transform(m);
+				shapePath.TransformBy(m);
 			}
 
 			dst.AddPath(shapePath);

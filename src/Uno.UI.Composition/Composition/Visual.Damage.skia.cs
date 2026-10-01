@@ -105,7 +105,7 @@ public partial class Visual
 			{
 				contentPath.Rewind();
 				contentPath.AddPath(ownContent);
-				contentPath.Transform(TotalMatrix.ToSKMatrix());
+				contentPath.TransformBy(TotalMatrix.ToSKMatrix());
 				OutsetForAntialiasing(contentPath);
 				contentPath.Op(clipPath, SKPathOp.Intersect, contentPath);
 				if (contentPath.IsEmpty)

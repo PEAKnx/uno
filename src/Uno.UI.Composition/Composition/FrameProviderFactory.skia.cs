@@ -262,7 +262,7 @@ internal static class FrameProviderFactory
 
 		var newBitmap = new SKBitmap(info);
 		using var canvas = new SKCanvas(newBitmap);
-		canvas.SetMatrix(matrix);
+		canvas.SetMatrixBy(matrix);
 		canvas.DrawBitmap(bitmap, 0, 0);
 		return SKImage.FromBitmap(newBitmap);
 	}

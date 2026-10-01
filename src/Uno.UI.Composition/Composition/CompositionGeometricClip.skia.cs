@@ -43,7 +43,7 @@ partial class CompositionGeometricClip
 				{
 					var transformedPath = _spareTransformedPath;
 					transformedPath.Rewind();
-					path.Transform(TransformMatrix.ToSKMatrix(), transformedPath);
+					path.TransformBy(TransformMatrix.ToSKMatrix(), transformedPath);
 					path = transformedPath;
 				}
 

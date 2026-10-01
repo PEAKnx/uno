@@ -492,7 +492,7 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 			if (GetPrePaintingClipping(preClip))
 			{
 				canvas.ClipPath(preClip, antialias: true);
-				preClip.Transform(toRoot);
+				preClip.TransformBy(toRoot);
 				ownClip.Op(preClip, SKPathOp.Intersect, ownClip);
 			}
 
@@ -503,7 +503,7 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 				var postClipInRoot = _pathPool.Allocate();
 				postClipInRoot.Rewind();
 				postClipInRoot.AddPath(postClip);
-				postClipInRoot.Transform(toRoot);
+				postClipInRoot.TransformBy(toRoot);
 				childClip.Op(postClipInRoot, SKPathOp.Intersect, childClip);
 				_pathPool.Free(postClipInRoot);
 			}
@@ -682,7 +682,7 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 		{
 			localClipCombinedByClipFromParent.AddRect(new SKRect(0, 0, Size.X, Size.Y));
 		}
-		localClipCombinedByClipFromParent.Transform(TotalMatrix.ToSKMatrix(), localClipCombinedByClipFromParent);
+		localClipCombinedByClipFromParent.TransformBy(TotalMatrix.ToSKMatrix(), localClipCombinedByClipFromParent);
 		localClipCombinedByClipFromParent.Op(clipFromParent, SKPathOp.Intersect, localClipCombinedByClipFromParent);
 
 		if (IsNativeHostVisual || CanPaint())
@@ -697,7 +697,7 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 
 		if (GetPostPaintingClipping() is { } postClip)
 		{
-			postClip.Transform(TotalMatrix.ToSKMatrix(), postClip);
+			postClip.TransformBy(TotalMatrix.ToSKMatrix(), postClip);
 			localClipCombinedByClipFromParent.Op(postClip, SKPathOp.Intersect, localClipCombinedByClipFromParent);
 		}
 		foreach (var child in GetChildrenInRenderOrder())
@@ -845,7 +845,7 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 				// position; the canvas scale only affects the mask blur's per-axis sigma.
 				var scratch = _spareShadowPath;
 				scratch.Rewind();
-				path.Transform(SKMatrix.CreateScale(1f, pathYScale), scratch);
+				path.TransformBy(SKMatrix.CreateScale(1f, pathYScale), scratch);
 				canvas.DrawPath(scratch, paint);
 			}
 		}
@@ -906,7 +906,7 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 			var sizeCandidate = _spareShadowPath;
 			sizeCandidate.Rewind();
 			sizeCandidate.AddRect(new SKRect(0, 0, size.X, size.Y));
-			sizeCandidate.Transform(toRoot);
+			sizeCandidate.TransformBy(toRoot);
 			if (hasClip)
 			{
 				sizeCandidate.Op(clipPath, SKPathOp.Intersect, sizeCandidate);
@@ -932,7 +932,7 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 			{
 				var transformed = _spareShadowPath;
 				transformed.Rewind();
-				path.Transform(toRoot, transformed);
+				path.TransformBy(toRoot, transformed);
 
 				if (hasClip)
 				{
@@ -958,7 +958,7 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 		{
 			var postClipInRoot = _spareShadowPath;
 			postClipInRoot.Rewind();
-			postClipLocal.Transform(toRoot, postClipInRoot);
+			postClipLocal.TransformBy(toRoot, postClipInRoot);
 
 			if (hasClip)
 			{
@@ -990,7 +990,7 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 		preClipLocal.Rewind();
 		if (visual.GetPrePaintingClipping(preClipLocal))
 		{
-			preClipLocal.Transform(toRoot, dst);
+			preClipLocal.TransformBy(toRoot, dst);
 			return true;
 		}
 		return false;

@@ -132,7 +132,7 @@ public partial class ContainerVisual : Visual
 			var childToParentTransform = (Parent?.TotalMatrix ?? Matrix4x4.Identity) * totalMatrixInverted;
 			if (!childToParentTransform.IsIdentity)
 			{
-				dst.Transform(childToParentTransform.ToSKMatrix());
+				dst.TransformBy(childToParentTransform.ToSKMatrix());
 			}
 		}
 

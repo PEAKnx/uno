@@ -20,7 +20,7 @@ namespace Microsoft.UI.Composition
 		public SkiaGeometrySource2D Transform(SKMatrix matrix)
 		{
 			var path = new SKPath();
-			_geometry.Transform(matrix, path);
+			_geometry.TransformBy(matrix, path);
 			return new SkiaGeometrySource2D(path);
 		}
 
