@@ -18,6 +18,7 @@ internal abstract class FrameBufferRenderer
 	private readonly float _cursorRadius;
 	private readonly bool? _cursorVisible;
 	protected SKSurface? _surface;
+	private Size _surfaceSize;
 	private int _renderCount;
 	private bool _receivedMouseEvent;
 
@@ -63,18 +64,22 @@ internal abstract class FrameBufferRenderer
 			DisplayOrientations.PortraitFlipped => (-90, 0, bounds.Width),
 			_ => throw new ArgumentOutOfRangeException()
 		};
-		_surface?.Canvas.Save();
-		_surface?.Canvas.Translate(transX, transY);
-		_surface?.Canvas.RotateDegrees(degrees);
-
-		ct.OnNativePlatformFrameRequested(_surface?.Canvas, size =>
+		// Full redraw every frame: CompositionTarget clips the frame to the damage region when it gets the
+		// previous canvas, assuming the target still holds the last frame. The GBM buffers rotate (the back
+		// buffer holds an older frame), and the complex damage clip is expensive on weak GPUs. A null canvas
+		// makes it treat every frame as new; the surface itself is reused while the size stays the same.
+		ct.OnNativePlatformFrameRequested(null, size =>
 		{
-			_surface?.Dispose();
 			if (orientation is DisplayOrientations.Portrait or DisplayOrientations.PortraitFlipped)
 			{
 				size = new Size(size.Height, size.Width);
 			}
-			_surface = UpdateSize((int)size.Width, (int)size.Height);
+			if (_surface is null || _surfaceSize != size)
+			{
+				_surface?.Dispose();
+				_surface = UpdateSize((int)size.Width, (int)size.Height);
+				_surfaceSize = size;
+			}
 			_surface.Canvas.Save();
 			_surface.Canvas.Translate((float)transX, (float)transY);
 			_surface.Canvas.RotateDegrees(degrees);
