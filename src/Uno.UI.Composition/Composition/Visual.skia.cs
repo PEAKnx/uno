@@ -206,6 +206,16 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 	}
 
 	/// <summary>
+	/// Marks the matrix of a descendant of a moved visual dirty and keeps the cached pictures. Own-content and
+	/// children pictures are recorded relative to their visual, so they stay valid when only an ancestor's
+	/// transform changed (e.g. the content of a ScrollPresenter). The moved visual itself still drops its
+	/// ancestors' pictures in <see cref="SetMatrixDirty"/>.
+	/// </summary>
+	internal virtual void SetMatrixDirtyKeepPictures() => _flags |= VisualFlags.MatrixDirty;
+
+	private protected bool IsMatrixDirtyFlagSet => (_flags & VisualFlags.MatrixDirty) != 0;
+
+	/// <summary>
 	/// This is the final transformation matrix from the origin to this Visual.
 	/// </summary>
 #if DEBUG
