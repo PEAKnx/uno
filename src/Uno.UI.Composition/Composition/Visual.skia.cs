@@ -83,6 +83,9 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 	private SKImage? _childrenImage;
 	private SKRect _childrenImageDest;
 	private float _childrenImageScale;
+	// Root-space bounds of the cached subtree when last drawn (damage of a moved cached subtree)
+	private SKRect _cachedSubtreeRootBounds;
+	private bool _hasCachedSubtreeRootBounds;
 	private int _framesSinceSubtreeNotChanged;
 
 	// Raised when this visual's own Clip/LayoutClip changes, and carried down the render walk so
@@ -446,6 +449,64 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 		return _childrenImage;
 	}
 
+	/// <summary>
+	/// A cached subtree is not walked, so its descendants cannot report that it moved: it reports its old and new
+	/// root-space bounds (within the clip) itself.
+	/// </summary>
+	private void ContributeCachedSubtreeDamage(SKPath damage, SKPath clip)
+	{
+		if (_childrenPictureBounds.IsEmpty)
+		{
+			return;
+		}
+		var now = RootBoundsOf(_childrenPictureBounds);
+		if (_hasCachedSubtreeRootBounds && now == _cachedSubtreeRootBounds)
+		{
+			return;
+		}
+
+		if (_hasCachedSubtreeRootBounds)
+		{
+			AddClipped(_cachedSubtreeRootBounds);
+		}
+		AddClipped(now);
+		_cachedSubtreeRootBounds = now;
+		_hasCachedSubtreeRootBounds = true;
+
+		void AddClipped(SKRect rect)
+		{
+			var clipped = clip.IsEmpty ? rect : SKRect.Intersect(rect, clip.Bounds);
+			if (!clipped.IsEmpty)
+			{
+				damage.UnionRect(clipped);
+			}
+		}
+	}
+
+	private SKRect RootBoundsOf(SKRect local)
+	{
+		var root = TotalMatrix.ToSKMatrix().MapRect(local);
+		root.Inflate(2, 2);
+		return new SKRect(MathF.Floor(root.Left), MathF.Floor(root.Top), MathF.Ceiling(root.Right), MathF.Ceiling(root.Bottom));
+	}
+
+	// Clip intersection in root coordinates for damage tracking: rectangles (the usual layout clips) without path
+	// boolean operations, which cost much more on every visual of every frame
+	private static void IntersectClip(SKPath target, SKPath clip)
+	{
+		if (target.IsRect && clip.IsRect)
+		{
+			var rect = SKRect.Intersect(target.Bounds, clip.Bounds);
+			target.Rewind();
+			if (!rect.IsEmpty)
+			{
+				target.AddRect(rect);
+			}
+			return;
+		}
+		target.Op(clip, SKPathOp.Intersect, target);
+	}
+
 	private static void DrawChildrenPicture(Visual visual, in PaintingSession session, IntPtr picture)
 	{
 		if (visual.GetLayerImage() is { } image)
@@ -673,7 +734,7 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 				if (trackDamage)
 				{
 					preClip.TransformBy(toRoot);
-					ownClip.Op(preClip, SKPathOp.Intersect, ownClip);
+					IntersectClip(ownClip, preClip);
 				}
 			}
 
@@ -688,7 +749,7 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 				postClipInRoot.Rewind();
 				postClipInRoot.AddPath(postClip);
 				postClipInRoot.TransformBy(toRoot);
-				childClip.Op(postClipInRoot, SKPathOp.Intersect, childClip);
+				IntersectClip(childClip, postClipInRoot);
 				_pathPool.Free(postClipInRoot);
 			}
 
@@ -788,6 +849,10 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 		{
 			if (visual._childrenPicture != IntPtr.Zero)
 			{
+				if (session.Damage is { } damage)
+				{
+					visual.ContributeCachedSubtreeDamage(damage, childClip);
+				}
 				DrawChildrenPicture(visual, session, visual._childrenPicture);
 			}
 			else if (!visual._enablePictureCollapsingOptimization
@@ -845,12 +910,15 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 					visual.ReleaseLayerCache();
 
 					visual._childrenPicture = picture;
-					if (pictureObject is not null)
+					visual._childrenPictureObject = pictureObject;
+					if (pictureObject is not null || session.Damage is not null)
 					{
-						visual._childrenPictureObject = pictureObject;
+						// Bounds of the layer image and of the damage when the cached subtree moves
 						var bounds = visual.GetSubtreeLayoutBounds();
 						bounds.Inflate(LayerCacheBoundsMargin, LayerCacheBoundsMargin);
 						visual._childrenPictureBounds = bounds;
+						visual._cachedSubtreeRootBounds = visual.RootBoundsOf(bounds);
+						visual._hasCachedSubtreeRootBounds = true;
 					}
 					DrawChildrenPicture(visual, session, picture);
 				}

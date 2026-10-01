@@ -215,17 +215,10 @@ public partial class ContainerVisual : Visual
 			// Currently, VisualCollection.GetEnumerator returns IEnumerator<Visual> instead of a concrete struct type to match WinUI API surface.
 			foreach (var child in Children.InnerList)
 			{
-				// Dropping every descendant's cached picture only serves damage tracking: a cached subtree is not
-				// walked, so it could not report that it moved. Without damage tracking the descendants keep their
-				// pictures, and scrolling draws them instead of re-recording every visual on every frame.
-				if (EnableDamageTracking)
-				{
-					child.SetMatrixDirty();
-				}
-				else
-				{
-					child.SetMatrixDirtyKeepPictures();
-				}
+				// The descendants keep their cached pictures (recorded relative to their visual), so scrolling draws
+				// them instead of re-recording every visual on every frame. A cached subtree reports its movement as
+				// damage itself (ContributeCachedSubtreeDamage), as it is not walked.
+				child.SetMatrixDirtyKeepPictures();
 			}
 
 			return true;
