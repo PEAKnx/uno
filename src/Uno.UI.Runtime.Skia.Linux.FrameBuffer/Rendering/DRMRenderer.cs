@@ -36,6 +36,8 @@ namespace Uno.UI.Runtime.Skia
 		private readonly IntPtr _gbmTargetSurface;
 		private readonly int _card;
 		private IntPtr _currentBo;
+		// Buffer of the page flip in flight; _currentBo stays on screen until it completes
+		private IntPtr _pendingBo;
 		private readonly uint _crtc;
 		private readonly uint _encoder;
 		// Frames are rendered and presented on a dedicated thread: an invalidation renders the current
@@ -299,22 +301,37 @@ namespace Uno.UI.Runtime.Skia
 			while (true)
 			{
 				_renderRequested.WaitOne();
-				_pageFlipDone.Wait();
 				if (_disposed)
 				{
 					return;
 				}
+				// The next frame is rendered while the previous page flip is still pending (one
+				// buffer on screen, one queued, one rendered), so CPU/GPU work overlaps the wait for vblank.
+				// Without a free GBM buffer it waits for the flip first, as before.
+				if (LibDrm.gbm_surface_has_free_buffers(_gbmTargetSurface) == 0)
+				{
+					_pageFlipDone.Wait();
+				}
 				// The frame rendered below includes every invalidation received so far
 				_renderRequested.Reset();
-				_pageFlipDone.Reset();
 				try
 				{
 					Render();
-					SwapAndPageFlip();
+					var bo = SwapBuffers();
+					_pageFlipDone.Wait();
+					if (_disposed)
+					{
+						return;
+					}
+					PageFlip(bo);
 				}
 				catch (Exception e)
 				{
-					_pageFlipDone.Set();
+					// A flip still in flight signals completion itself
+					if (_pendingBo == IntPtr.Zero)
+					{
+						_pageFlipDone.Set();
+					}
 					if (this.Log().IsEnabled(LogLevel.Error))
 					{
 						this.Log().Error("Rendering or presenting a DRM frame failed.", e);
@@ -323,7 +340,7 @@ namespace Uno.UI.Runtime.Skia
 			}
 		}
 
-		private unsafe void SwapAndPageFlip()
+		private IntPtr SwapBuffers()
 		{
 			using (MakeCurrent())
 			{
@@ -340,16 +357,29 @@ namespace Uno.UI.Runtime.Skia
 			{
 				throw new InvalidOperationException($"{nameof(LibDrm.gbm_surface_lock_front_buffer)} failed");
 			}
+			return nextBo;
+		}
 
-			LibDrm.gbm_surface_release_buffer(_gbmTargetSurface, _currentBo);
-			_currentBo = nextBo;
+		/// <summary>Queues <paramref name="bo"/> for the next vblank; the previous flip must have completed.</summary>
+		private unsafe void PageFlip(IntPtr bo)
+		{
+			// The pending buffer is on screen now: the one it replaced can be rendered into again
+			if (_pendingBo != IntPtr.Zero)
+			{
+				LibDrm.gbm_surface_release_buffer(_gbmTargetSurface, _currentBo);
+				_currentBo = _pendingBo;
+				_pendingBo = IntPtr.Zero;
+			}
 
-			var fb = CreateFbForBo(nextBo);
+			var fb = CreateFbForBo(bo);
+			_pageFlipDone.Reset();
 			var res = LibDrm.drmModePageFlip(_card, _crtc, fb, LibDrm.DrmModePageFlip.Event, (void*)GCHandle.ToIntPtr(_selfHandle));
 			if (res != 0)
 			{
+				LibDrm.gbm_surface_release_buffer(_gbmTargetSurface, bo);
 				throw new InvalidOperationException($"{nameof(LibDrm.drmModePageFlip)} failed ({res})");
 			}
+			_pendingBo = bo;
 		}
 
 		protected override IDisposable MakeCurrent()
@@ -425,15 +455,19 @@ namespace Uno.UI.Runtime.Skia
 			_renderTarget = new GRBackendRenderTarget(width, height, _samples, _stencil, glInfo);
 			_glFbSurface = SKSurface.Create(_grContext, _renderTarget, grSurfaceOrigin, SKColorType.Rgb888x);
 
-			return SKSurface.Create(_grContext, budgeted: true, new SKImageInfo(width, height, SKColorType.Rgba8888, SKAlphaType.Premul))
-				?? throw new InvalidOperationException("Failed to create the DRM retained composition surface.");
+			// Every frame is a full redraw, so it is drawn straight into the scanout buffer
+			// instead of a retained surface that was copied to it (a full-screen blit per frame)
+			return _glFbSurface ?? throw new InvalidOperationException("Failed to create the DRM framebuffer surface.");
 		}
 
 		protected override void PresentToOutput(int degrees, int transX, int transY)
 		{
 			if (_surface is { } composition && _glFbSurface is { } glFb)
 			{
-				composition.Draw(glFb.Canvas, 0, 0, null);
+				if (!ReferenceEquals(composition, glFb))
+				{
+					composition.Draw(glFb.Canvas, 0, 0, null);
+				}
 				DrawCursor(glFb.Canvas, degrees, transX, transY);
 				glFb.Canvas.Flush();
 			}
