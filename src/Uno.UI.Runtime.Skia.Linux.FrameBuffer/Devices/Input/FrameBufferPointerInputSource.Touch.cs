@@ -26,6 +26,11 @@ namespace Uno.UI.Runtime.Skia;
 unsafe internal partial class FrameBufferPointerInputSource
 {
 	private readonly Dictionary<uint, Point> _activePointers = new();
+	// libinput reuses the slot number for every new contact (slot 0 for single touch). Uno keeps state per
+	// pointer id (capture, gestures, manipulations); a stale entry of a previous contact then swallowed every
+	// following touch. Like on Windows, each contact gets its own pointer id.
+	private readonly Dictionary<int, uint> _slotPointerIds = new();
+	private uint _nextTouchPointerId = 1;
 	private readonly HashSet<libinput_event_code> _pointerPressed = new();
 
 	public void ProcessTouchEvent(IntPtr rawEvent, libinput_event_type rawEventType)
@@ -37,7 +42,21 @@ unsafe internal partial class FrameBufferPointerInputSource
 		{
 			var properties = new PointerPointProperties();
 			var timestamp = libinput_event_touch_get_time_usec(rawTouchEvent);
-			var pointerId = (uint)libinput_event_touch_get_slot(rawTouchEvent);
+			var slot = libinput_event_touch_get_slot(rawTouchEvent);
+			uint pointerId;
+			if (rawEventType == LIBINPUT_EVENT_TOUCH_DOWN || !_slotPointerIds.TryGetValue(slot, out pointerId))
+			{
+				pointerId = _nextTouchPointerId++;
+				if (_nextTouchPointerId == 0)
+				{
+					_nextTouchPointerId = 1;
+				}
+				_slotPointerIds[slot] = pointerId;
+			}
+			if (rawEventType == LIBINPUT_EVENT_TOUCH_UP || rawEventType == LIBINPUT_EVENT_TOUCH_CANCEL)
+			{
+				_slotPointerIds.Remove(slot);
+			}
 			Action<PointerEventArgs>? raisePointerEvent = null;
 			Point currentPosition;
 
@@ -56,7 +75,7 @@ unsafe internal partial class FrameBufferPointerInputSource
 
 			if (this.Log().IsEnabled(LogLevel.Trace))
 			{
-				this.Log().Trace($"ProcessTouchEvent: {rawEventType}, pointerId:{pointerId}, currentPosition:{currentPosition}, timestamp:{timestamp}");
+				this.Log().Trace($"ProcessTouchEvent: {rawEventType}, slot:{slot}, pointerId:{pointerId}, currentPosition:{currentPosition}, timestamp:{timestamp}");
 			}
 
 			switch (rawEventType)
