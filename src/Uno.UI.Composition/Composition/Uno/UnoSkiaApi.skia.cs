@@ -41,6 +41,9 @@ internal static class UnoSkiaApi
 	internal static extern void sk_refcnt_safe_unref(IntPtr refcnt);
 
 	[DllImport(SKIA, CallingConvention = CallingConvention.Cdecl)]
+	internal static extern void sk_refcnt_safe_ref(IntPtr refcnt);
+
+	[DllImport(SKIA, CallingConvention = CallingConvention.Cdecl)]
 	internal static extern unsafe void sk_rrect_set_rect_radii(IntPtr rrect, SKRect* rect, SKPoint* radii);
 
 	[DllImport(SKIA, CallingConvention = CallingConvention.Cdecl)]

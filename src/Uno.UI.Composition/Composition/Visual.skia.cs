@@ -51,6 +51,38 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 	private (Matrix4x4 matrix, bool isLocalMatrixIdentity) _totalMatrix = (Matrix4x4.Identity, true);
 	private IntPtr _picture;
 	private IntPtr _childrenPicture;
+
+	/// <summary>
+	/// Layer cache: a collapsed subtree (see <see cref="EnablePictureCollapsingOptimization"/>) is drawn as an image
+	/// of its children picture. Skia rasterizes the image once at the rasterization scale (into a GPU texture on a
+	/// GPU canvas) and keeps it cached, so an unchanged subtree costs one image draw per frame instead of replaying
+	/// all its draw calls. Subtrees larger than <see cref="LayerCacheMaxTextureSize"/> or
+	/// <see cref="LayerCacheMaxPixels"/> are not collapsed, so their children are cached one by one. The image covers
+	/// the layout bounds of the subtree plus <see cref="LayerCacheBoundsMargin"/>; content painted further outside is
+	/// cut off. Subtrees under a scale or rotation (other than the host's) draw the picture.
+	/// </summary>
+	internal static bool EnableLayerCache { get; set; }
+
+	/// <summary>Maximum width and height of a layer cache image, in pixels.</summary>
+	internal static int LayerCacheMaxTextureSize { get; set; } = 2048;
+
+	/// <summary>Maximum area of a layer cache image, in pixels.</summary>
+	internal static long LayerCacheMaxPixels { get; set; } = 2_000_000;
+
+	/// <summary>Margin around the subtree's layout bounds covered by a layer cache image (antialiasing, strokes).</summary>
+	internal static float LayerCacheBoundsMargin { get; set; } = 2;
+
+	// Diagnostics: cached subtrees drawn as image / as picture, collapsed recordings, images created
+	internal static long LayerImagesDrawn, LayerPicturesDrawn, LayerRecordings, LayerImagesCreated;
+
+	private static readonly SKSamplingOptions s_layerSampling = new(SKFilterMode.Nearest);
+	// Rasterization scale of the frame being rendered (device pixels per unit)
+	private static float s_rasterizationScale = 1;
+	private SKPicture? _childrenPictureObject;
+	private SKRect _childrenPictureBounds;
+	private SKImage? _childrenImage;
+	private SKRect _childrenImageDest;
+	private float _childrenImageScale;
 	private int _framesSinceSubtreeNotChanged;
 
 	// Raised when this visual's own Clip/LayoutClip changes, and carried down the render walk so
@@ -312,6 +344,125 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 		InvalidateParentChildrenPicture(false);
 	}
 
+	private void ReleaseLayerCache()
+	{
+		_childrenImage?.Dispose();
+		_childrenImage = null;
+		_childrenPictureObject?.Dispose();
+		_childrenPictureObject = null;
+	}
+
+	private bool TooLargeForLayerCache()
+	{
+		if (!EnableLayerCache)
+		{
+			return false;
+		}
+		var width = Size.X * s_rasterizationScale;
+		var height = Size.Y * s_rasterizationScale;
+		return width > LayerCacheMaxTextureSize || height > LayerCacheMaxTextureSize || (double)width * height > LayerCacheMaxPixels;
+	}
+
+	private static bool IsTranslationOnly(in Matrix4x4 m)
+		=> m.M11 == 1 && m.M22 == 1 && m.M12 == 0 && m.M21 == 0;
+
+	/// <summary>Layout bounds of this visual's subtree in its own coordinates (visible visuals only).</summary>
+	private SKRect GetSubtreeLayoutBounds()
+	{
+		Matrix4x4.Invert(TotalMatrix, out var toLocal);
+		var bounds = SKRect.Empty;
+		AddSubtreeLayoutBounds(this, toLocal, ref bounds);
+		return bounds;
+
+		static void AddSubtreeLayoutBounds(Visual visual, Matrix4x4 toLocal, ref SKRect bounds)
+		{
+			if (!visual.IsVisible || visual.Opacity == 0)
+			{
+				return;
+			}
+			if (visual.Size.X > 0 && visual.Size.Y > 0)
+			{
+				var m = visual.TotalMatrix * toLocal;
+				var p1 = Vector2.Transform(Vector2.Zero, m);
+				var p2 = Vector2.Transform(new Vector2(visual.Size.X, 0), m);
+				var p3 = Vector2.Transform(new Vector2(0, visual.Size.Y), m);
+				var p4 = Vector2.Transform(visual.Size, m);
+				var rect = new SKRect(
+					MathF.Min(MathF.Min(p1.X, p2.X), MathF.Min(p3.X, p4.X)),
+					MathF.Min(MathF.Min(p1.Y, p2.Y), MathF.Min(p3.Y, p4.Y)),
+					MathF.Max(MathF.Max(p1.X, p2.X), MathF.Max(p3.X, p4.X)),
+					MathF.Max(MathF.Max(p1.Y, p2.Y), MathF.Max(p3.Y, p4.Y)));
+				bounds = bounds.IsEmpty ? rect : SKRect.Union(bounds, rect);
+			}
+			foreach (var child in visual.GetChildrenInRenderOrder())
+			{
+				AddSubtreeLayoutBounds(child, toLocal, ref bounds);
+			}
+		}
+	}
+
+	/// <summary>The layer cache image of the cached children picture, created or re-created for the current scale.</summary>
+	private SKImage? GetLayerImage()
+	{
+		if (!EnableLayerCache || _childrenPictureObject is not { } picture || !IsTranslationOnly(TotalMatrix))
+		{
+			return null;
+		}
+		if (_childrenImage is not null && _childrenImageScale == s_rasterizationScale)
+		{
+			return _childrenImage;
+		}
+
+		_childrenImage?.Dispose();
+		_childrenImage = null;
+		var s = s_rasterizationScale;
+		var bounds = _childrenPictureBounds;
+		if (bounds.IsEmpty)
+		{
+			return null;
+		}
+		// Align the image's pixel grid with the device pixel grid at the visual's current position, so an image
+		// drawn where it was created matches direct drawing pixel for pixel (a moved one is off by < 1/2 pixel)
+		var total = TotalMatrix;
+		var fracX = total.M41 * s - MathF.Floor(total.M41 * s);
+		var fracY = total.M42 * s - MathF.Floor(total.M42 * s);
+		var left = MathF.Floor(bounds.Left * s + fracX) - fracX;
+		var top = MathF.Floor(bounds.Top * s + fracY) - fracY;
+		var right = MathF.Ceiling(bounds.Right * s + fracX) - fracX;
+		var bottom = MathF.Ceiling(bounds.Bottom * s + fracY) - fracY;
+		var width = MathF.Round(right - left);
+		var height = MathF.Round(bottom - top);
+		if (width <= 0 || height <= 0 || width > LayerCacheMaxTextureSize || height > LayerCacheMaxTextureSize || (double)width * height > LayerCacheMaxPixels)
+		{
+			return null;
+		}
+
+		// Local units to image pixels: scale, then move the bounds to the origin
+		var matrix = new SKMatrix(s, 0, -left, 0, s, -top, 0, 0, 1);
+		_childrenImage = SKImage.FromPicture(picture, new SKSizeI((int)width, (int)height), matrix);
+		_childrenImageDest = new SKRect(left / s, top / s, right / s, bottom / s);
+		_childrenImageScale = s;
+		LayerImagesCreated++;
+		return _childrenImage;
+	}
+
+	private static void DrawChildrenPicture(Visual visual, in PaintingSession session, IntPtr picture)
+	{
+		if (visual.GetLayerImage() is { } image)
+		{
+			LayerImagesDrawn++;
+			session.Canvas.DrawImage(image, visual._childrenImageDest, s_layerSampling, null);
+		}
+		else
+		{
+			LayerPicturesDrawn++;
+			unsafe
+			{
+				UnoSkiaApi.sk_canvas_draw_picture(session.Canvas.Handle, picture, null, IntPtr.Zero);
+			}
+		}
+	}
+
 	internal void InvalidateParentChildrenPicture(bool includeSelf)
 	{
 		var parent = includeSelf ? this : Parent;
@@ -321,6 +472,7 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 			{
 				UnoSkiaApi.sk_refcnt_safe_unref(parent._childrenPicture);
 				parent._childrenPicture = IntPtr.Zero;
+				parent.ReleaseLayerCache();
 			}
 			parent._flags |= VisualFlags.ChildrenSKPictureInvalid;
 			parent = parent.Parent;
@@ -404,6 +556,11 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 		if (!EnableDamageTracking)
 		{
 			damage = null;
+		}
+
+		if (CompositionTarget is { } target)
+		{
+			s_rasterizationScale = (float)target.RasterizationScale;
 		}
 
 		// Since we're acting as if this visual is a root visual, we undo the parent's TotalMatrix
@@ -631,15 +788,13 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 		{
 			if (visual._childrenPicture != IntPtr.Zero)
 			{
-				unsafe
-				{
-					UnoSkiaApi.sk_canvas_draw_picture(session.Canvas.Handle, visual._childrenPicture, null, IntPtr.Zero);
-				}
+				DrawChildrenPicture(visual, session, visual._childrenPicture);
 			}
 			else if (!visual._enablePictureCollapsingOptimization
 					 || visual._framesSinceSubtreeNotChanged < visual._pictureCollapsingOptimizationFrameThreshold
 					 || !applyChildOptimization
-					 || visual.GetSubTreeVisualCount() < visual._pictureCollapsingOptimizationVisualCountThreshold)
+					 || visual.GetSubTreeVisualCount() < visual._pictureCollapsingOptimizationVisualCountThreshold
+					 || visual.TooLargeForLayerCache())
 			{
 				foreach (var child in visual.GetChildrenInRenderOrder())
 				{
@@ -648,7 +803,7 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 			}
 			else
 			{
-				var recorder = new SKPictureRecorder();
+				using var recorder = new SKPictureRecorder();
 				var recordingCanvas = recorder.BeginRecording(InfiniteClipRect);
 				// child.Render will reapply the total transform matrix, so we need to invert ours.
 				Matrix4x4.Invert(visual.TotalMatrix, out var rootTransform);
@@ -661,12 +816,20 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 					}
 				}
 
+				LayerRecordings++;
 				var picture = IntPtr.Zero;
-
-				unsafe
+				SKPicture? pictureObject = null;
+				if (EnableLayerCache)
+				{
+					// Kept as an object to create the layer image; the handle gets its own reference like a picture
+					// from sk_picture_recorder_end_recording
+					pictureObject = recorder.EndRecording();
+					picture = pictureObject.Handle;
+					UnoSkiaApi.sk_refcnt_safe_ref(picture);
+				}
+				else
 				{
 					picture = UnoSkiaApi.sk_picture_recorder_end_recording(recorder.Handle);
-					UnoSkiaApi.sk_canvas_draw_picture(session.Canvas.Handle, picture, null, IntPtr.Zero);
 				}
 
 				// The visual can be set on a ChildrenSKPictureInvalid path after the render has started.
@@ -679,12 +842,26 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 					{
 						UnoSkiaApi.sk_refcnt_safe_unref(visual._childrenPicture);
 					}
+					visual.ReleaseLayerCache();
 
 					visual._childrenPicture = picture;
+					if (pictureObject is not null)
+					{
+						visual._childrenPictureObject = pictureObject;
+						var bounds = visual.GetSubtreeLayoutBounds();
+						bounds.Inflate(LayerCacheBoundsMargin, LayerCacheBoundsMargin);
+						visual._childrenPictureBounds = bounds;
+					}
+					DrawChildrenPicture(visual, session, picture);
 				}
 				else
 				{
+					unsafe
+					{
+						UnoSkiaApi.sk_canvas_draw_picture(session.Canvas.Handle, picture, null, IntPtr.Zero);
+					}
 					UnoSkiaApi.sk_refcnt_safe_unref(picture);
+					pictureObject?.Dispose();
 				}
 			}
 		}
