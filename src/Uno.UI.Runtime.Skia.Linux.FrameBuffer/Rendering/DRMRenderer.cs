@@ -352,18 +352,21 @@ namespace Uno.UI.Runtime.Skia
 					_renderRequested.Reset();
 					try
 					{
+						var started = Stopwatch.GetTimestamp();
 						if (!Render())
 						{
 							// The frame on screen is still current
 							continue;
 						}
 						var bo = SwapBuffers();
+						Interlocked.Add(ref DRMDisplayPower.RenderTicksTotal, Stopwatch.GetTimestamp() - started);
 						_pageFlipDone.Wait();
 						if (_disposed)
 						{
 							return;
 						}
 						PageFlip(bo);
+						Interlocked.Increment(ref DRMDisplayPower.PresentedFramesCount);
 					}
 					catch (Exception e)
 					{

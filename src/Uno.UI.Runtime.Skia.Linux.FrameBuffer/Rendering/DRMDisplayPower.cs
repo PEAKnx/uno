@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace Uno.UI.Runtime.Skia
 {
@@ -15,6 +16,15 @@ namespace Uno.UI.Runtime.Skia
 
 		/// <summary>Returns false if no DRM renderer is active or the DPMS call failed.</summary>
 		public static bool SetDisplayOn(bool on) => Renderer?.SetDisplayOn(on) ?? false;
+
+		internal static long PresentedFramesCount;
+		internal static long RenderTicksTotal;
+
+		/// <summary>Frames rendered and queued for page flip since start (diagnostics).</summary>
+		public static long PresentedFrames => Interlocked.Read(ref PresentedFramesCount);
+
+		/// <summary>Stopwatch ticks spent rendering and presenting those frames (diagnostics).</summary>
+		public static long RenderTicks => Interlocked.Read(ref RenderTicksTotal);
 	}
 
 	internal static class DRMDisplayPowerNative
