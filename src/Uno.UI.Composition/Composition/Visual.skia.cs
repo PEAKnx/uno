@@ -1,4 +1,5 @@
-﻿#nullable enable
+﻿// Modified by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
+#nullable enable
 //#define TRACE_COMPOSITION
 
 using System;

@@ -1,3 +1,4 @@
+// Added by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
 using Uno.UI.Dispatching;
 using Uno.WinUI.Runtime.Skia.Linux.FrameBuffer.UI;
 using Windows.Graphics.Display;
