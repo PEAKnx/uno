@@ -44,6 +44,12 @@ namespace Uno.UI.Runtime.Skia
 		// state and presents it right away. Invalidations during a pending page flip coalesce into one frame.
 		private readonly AutoResetEvent _renderRequested = new(false);
 		private readonly ManualResetEventSlim _pageFlipDone = new(true);
+		// Display power (DPMS) switched through DRMDisplayPower; no frames are rendered while off
+		private readonly object _powerLock = new();
+		private readonly object _dpmsLock = new();
+		private uint _connectorId;
+		private uint _dpmsPropertyId;
+		private bool _displayOff;
 		private readonly GCHandle _selfHandle;
 		private readonly DRMBusyIndicator? _busyIndicator;
 
@@ -246,7 +252,16 @@ namespace Uno.UI.Runtime.Skia
 			}
 
 			_currentBo = bo;
-			_busyIndicator = DRMBusyIndicator.TryStart(_card, _crtc, device, modeInfo.Resolution.Width, modeInfo.Resolution.Height, () => !_disposed);
+			_connectorId = connectorId;
+			_dpmsPropertyId = FindConnectorProperty(connectorId, "DPMS");
+			DRMDisplayPower.Renderer = this;
+			_busyIndicator = DRMBusyIndicator.TryStart(_card, _crtc, device, modeInfo.Resolution.Width, modeInfo.Resolution.Height, () =>
+			{
+				lock (_powerLock)
+				{
+					return !_displayOff && !_disposed;
+				}
+			});
 
 			var glInterface = GRGlInterface.CreateGles(EglHelper.EglGetProcAddress);
 
@@ -317,7 +332,7 @@ namespace Uno.UI.Runtime.Skia
 				{
 					return;
 				}
-				// App work on the render thread (FrameBufferGpu.TryInvoke)
+				// App work on the render thread (FrameBufferGpu.TryInvoke), also while the display is off
 				FrameBufferGpu.RunPending(_grContext);
 				// The next frame is rendered while the previous page flip is still pending (one
 				// buffer on screen, one queued, one rendered), so CPU/GPU work overlaps the wait for vblank.
@@ -326,35 +341,114 @@ namespace Uno.UI.Runtime.Skia
 				{
 					_pageFlipDone.Wait();
 				}
-				// The frame rendered below includes every invalidation received so far
-				_renderRequested.Reset();
-				try
+				lock (_powerLock)
 				{
-					if (!Render())
+					if (_displayOff)
 					{
-						// The frame on screen is still current
+						// Rendered when the display is switched on again
 						continue;
 					}
-					var bo = SwapBuffers();
-					_pageFlipDone.Wait();
-					if (_disposed)
+					// The frame rendered below includes every invalidation received so far
+					_renderRequested.Reset();
+					try
 					{
-						return;
+						if (!Render())
+						{
+							// The frame on screen is still current
+							continue;
+						}
+						var bo = SwapBuffers();
+						_pageFlipDone.Wait();
+						if (_disposed)
+						{
+							return;
+						}
+						PageFlip(bo);
 					}
-					PageFlip(bo);
+					catch (Exception e)
+					{
+						// A flip still in flight signals completion itself
+						if (_pendingBo == IntPtr.Zero)
+						{
+							_pageFlipDone.Set();
+						}
+						if (this.Log().IsEnabled(LogLevel.Error))
+						{
+							this.Log().Error("Rendering or presenting a DRM frame failed.", e);
+						}
+					}
 				}
-				catch (Exception e)
+			}
+		}
+
+		/// <summary>Switches the display off (DPMS) or on; rendering pauses while off, a new frame is presented on wake.</summary>
+		internal bool SetDisplayOn(bool on)
+		{
+			lock (_dpmsLock)
+			{
+				if (_disposed || _dpmsPropertyId == 0)
 				{
-					// A flip still in flight signals completion itself
-					if (_pendingBo == IntPtr.Zero)
+					this.LogError()?.Error($"Display power not available (disposed: {_disposed}, DPMS property: {_dpmsPropertyId}).");
+					return false;
+				}
+
+				if (!on)
+				{
+					lock (_powerLock)
 					{
-						_pageFlipDone.Set();
+						_displayOff = true;
 					}
-					if (this.Log().IsEnabled(LogLevel.Error))
+					// A page flip on an inactive CRTC fails; let the pending one complete first
+					if (!_pageFlipDone.Wait(TimeSpan.FromSeconds(1)))
 					{
-						this.Log().Error("Rendering or presenting a DRM frame failed.", e);
+						this.LogWarn()?.Warn("Page flip still pending while switching the display off.");
 					}
 				}
+
+				var res = DRMDisplayPowerNative.drmModeConnectorSetProperty(_card, _connectorId, _dpmsPropertyId, on ? DRMDisplayPowerNative.DpmsOn : DRMDisplayPowerNative.DpmsOff);
+				if (res != 0)
+				{
+					this.LogError()?.Error($"Setting DPMS {(on ? "on" : "off")} failed ({res}).");
+				}
+				else
+				{
+					this.LogInfo()?.Info($"Display switched {(on ? "on" : "off")}.");
+				}
+
+				if (on || res != 0)
+				{
+					lock (_powerLock)
+					{
+						_displayOff = false;
+					}
+					// Present the current state; frames skipped while off are not on screen
+					_renderRequested.Set();
+				}
+				return res == 0;
+			}
+		}
+
+		private unsafe uint FindConnectorProperty(uint connectorId, string name)
+		{
+			var connector = LibDrm.drmModeGetConnectorCurrent(_card, connectorId);
+			if (connector == null)
+			{
+				return 0;
+			}
+			try
+			{
+				for (var i = 0; i < connector->count_props; i++)
+				{
+					if (DRMDisplayPowerNative.GetPropertyName(_card, connector->props[i]) == name)
+					{
+						return connector->props[i];
+					}
+				}
+				return 0;
+			}
+			finally
+			{
+				LibDrm.drmModeFreeConnector(connector);
 			}
 		}
 
@@ -564,6 +658,10 @@ namespace Uno.UI.Runtime.Skia
 				return;
 			}
 			_disposed = true;
+			if (DRMDisplayPower.Renderer == this)
+			{
+				DRMDisplayPower.Renderer = null;
+			}
 			FrameBufferGpu.Detach(this);
 			_busyIndicator?.Dispose();
 			// Wake the render loop so it exits
