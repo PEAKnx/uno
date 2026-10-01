@@ -38,8 +38,10 @@ namespace Uno.UI.Runtime.Skia
 		private IntPtr _currentBo;
 		private readonly uint _crtc;
 		private readonly uint _encoder;
-		private bool _waitingForPageFlip;
-		private bool _invalidateRenderCalledWhileWaitingForPageFlip;
+		// Frames are rendered and presented on a dedicated thread: an invalidation renders the current
+		// state and presents it right away. Invalidations during a pending page flip coalesce into one frame.
+		private readonly AutoResetEvent _renderRequested = new(false);
+		private readonly ManualResetEventSlim _pageFlipDone = new(true);
 		private readonly GCHandle _selfHandle;
 
 		private LibDrm.drmModeCrtc _savedCrtc;
@@ -259,6 +261,7 @@ namespace Uno.UI.Runtime.Skia
 			FrameBufferWindowWrapper.Instance.SetSize(new Size(modeInfo.Resolution.Width, modeInfo.Resolution.Height));
 
 			new Thread(PageFlipLoop) { IsBackground = true, Name = "DRM pageflip loop" }.Start();
+			new Thread(RenderLoop) { IsBackground = true, Name = "DRM render loop" }.Start();
 		}
 
 		private unsafe int CalculateRefreshRate(LibDrm.drmModeModeInfo* mode)
@@ -283,19 +286,45 @@ namespace Uno.UI.Runtime.Skia
 			return res / 1000;
 		}
 
-		public override unsafe void InvalidateRender()
+		public override void InvalidateRender()
 		{
-			if (_disposed)
+			if (!_disposed)
 			{
-				return;
+				_renderRequested.Set();
 			}
+		}
 
-			Volatile.Write(ref _invalidateRenderCalledWhileWaitingForPageFlip, true);
-			if (Interlocked.Exchange(ref _waitingForPageFlip, true))
+		private void RenderLoop()
+		{
+			while (true)
 			{
-				return;
+				_renderRequested.WaitOne();
+				_pageFlipDone.Wait();
+				if (_disposed)
+				{
+					return;
+				}
+				// The frame rendered below includes every invalidation received so far
+				_renderRequested.Reset();
+				_pageFlipDone.Reset();
+				try
+				{
+					Render();
+					SwapAndPageFlip();
+				}
+				catch (Exception e)
+				{
+					_pageFlipDone.Set();
+					if (this.Log().IsEnabled(LogLevel.Error))
+					{
+						this.Log().Error("Rendering or presenting a DRM frame failed.", e);
+					}
+				}
 			}
+		}
 
+		private unsafe void SwapAndPageFlip()
+		{
 			using (MakeCurrent())
 			{
 				if (!EglHelper.EglSwapBuffers(_eglDisplay, _eglSurface))
@@ -383,13 +412,7 @@ namespace Uno.UI.Runtime.Skia
 			{
 				return;
 			}
-			Volatile.Write(ref @this._invalidateRenderCalledWhileWaitingForPageFlip, false);
-			@this.Render();
-			Volatile.Write(ref @this._waitingForPageFlip, false);
-			if (Volatile.Read(ref @this._invalidateRenderCalledWhileWaitingForPageFlip))
-			{
-				@this.InvalidateRender();
-			}
+			@this._pageFlipDone.Set();
 		}
 
 		protected override SKSurface UpdateSize(int width, int height)
@@ -456,6 +479,9 @@ namespace Uno.UI.Runtime.Skia
 				return;
 			}
 			_disposed = true;
+			// Wake the render loop so it exits
+			_renderRequested.Set();
+			_pageFlipDone.Set();
 
 			if (_crtcRestored)
 			{
