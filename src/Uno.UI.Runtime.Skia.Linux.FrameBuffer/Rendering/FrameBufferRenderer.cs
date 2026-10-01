@@ -31,6 +31,12 @@ internal abstract class FrameBufferRenderer
 	// Partial redraw: geometry of the retained frame, and the frame to redraw completely until a newer one was drawn
 	private (Windows.Graphics.SizeInt32 Bounds, DisplayOrientations Orientation, float Scale) _geometry;
 	private object? _redrawUntilNewerThan;
+	// The retained frame missed frames drawn straight into the output (DirectSurface): redraw it completely next
+	private bool _retainedStale;
+
+	// Damaged share of the screen from which a frame is drawn straight into the output: redrawing nearly everything
+	// into the retained frame and copying it costs more than a full redraw (scrolling, fullscreen video)
+	private const double DirectRedrawDamage = 0.5;
 
 	public readonly record struct MouseIndicatorOptions(bool? ShowMouseCursor, float MouseCursorRadius, System.Drawing.Color MouseCursorColor);
 
@@ -101,7 +107,52 @@ internal abstract class FrameBufferRenderer
 				_geometry = geometry;
 				_redrawUntilNewerThan = slotBefore;
 			}
-			var redraw = _redrawUntilNewerThan is not null;
+			var scale = FrameBufferWindowWrapper.Instance.RasterizationScale;
+			if (DirectSurface is { } direct && slotBefore is not null && !ReferenceEquals(slotBefore, _presentedFrame)
+				&& CompositionTargetFrameSlot.DamageFraction(ct, bounds.Width * bounds.Height / (scale * scale)) >= DirectRedrawDamage)
+			{
+				// Full redraw into the output buffer, no copy; the retained frame is redrawn with the next partial frame
+				direct.Canvas.Save();
+				ct.OnNativePlatformFrameRequested(null, _ =>
+				{
+					direct.Canvas.Translate((float)transX, (float)transY);
+					direct.Canvas.RotateDegrees(degrees);
+					return direct.Canvas;
+				});
+				direct.Canvas.Restore();
+				direct.Flush();
+				_retainedStale = true;
+				var drawnDirectly = DrawnFrame(ct, slotBefore);
+				if (drawnDirectly is not null && !ReferenceEquals(drawnDirectly, _redrawUntilNewerThan))
+				{
+					_redrawUntilNewerThan = null;
+				}
+				return Present(drawnDirectly, recreated: true, degrees, transX, transY, toOutput: false);
+			}
+
+			if (_retainedStale && _surface is { } retained && slotBefore is not null && ReferenceEquals(slotBefore, _presentedFrame)
+				&& CursorPosition == _presentedCursor)
+			{
+				// The frame on screen was drawn directly and nothing new was recorded: drawn clipped out (the request
+				// schedules the next recording); the retained frame is redrawn with the next new frame
+				retained.Canvas.Save();
+				retained.Canvas.ClipRect(SKRect.Empty);
+				var resized = false;
+				ct.OnNativePlatformFrameRequested(retained.Canvas, _ =>
+				{
+					resized = true;
+					return retained.Canvas;
+				});
+				retained.Canvas.Restore();
+				if (resized)
+				{
+					// Drawn clipped out at a new size: draw it on the next pass
+					InvalidateRender();
+				}
+				return false;
+			}
+
+			var redraw = _redrawUntilNewerThan is not null || _retainedStale;
 
 			// Otherwise the surface still holds the last frame: CompositionTarget clips this frame to its damage region
 			var canvas = redraw ? null : _surface?.Canvas;
@@ -130,9 +181,13 @@ internal abstract class FrameBufferRenderer
 			_surface?.Flush();
 
 			var drawn = DrawnFrame(ct, slotBefore);
-			if (redraw && drawn is not null && !ReferenceEquals(drawn, _redrawUntilNewerThan))
+			if (redraw && drawn is not null)
 			{
-				_redrawUntilNewerThan = null;
+				_retainedStale = false;
+				if (!ReferenceEquals(drawn, _redrawUntilNewerThan))
+				{
+					_redrawUntilNewerThan = null;
+				}
 			}
 			return Present(drawn, recreated || redraw, degrees, transX, transY);
 		}
@@ -197,7 +252,7 @@ internal abstract class FrameBufferRenderer
 	private static object? DrawnFrame(CompositionTarget ct, object? slotBefore)
 		=> slotBefore is not null && ReferenceEquals(slotBefore, CompositionTargetFrameSlot.Current(ct)) ? slotBefore : null;
 
-	private bool Present(object? drawn, bool recreated, int degrees, int transX, int transY)
+	private bool Present(object? drawn, bool recreated, int degrees, int transX, int transY, bool toOutput = true)
 	{
 		var cursor = CursorPosition;
 		if (drawn is not null && ReferenceEquals(drawn, _presentedFrame) && !recreated && cursor == _presentedCursor)
@@ -207,7 +262,14 @@ internal abstract class FrameBufferRenderer
 		_presentedFrame = drawn;
 		_presentedCursor = cursor;
 
-		PresentToOutput(degrees, transX, transY);
+		if (toOutput)
+		{
+			PresentToOutput(degrees, transX, transY);
+		}
+		else
+		{
+			PresentDirect(degrees, transX, transY);
+		}
 		return true;
 	}
 
@@ -235,6 +297,16 @@ internal abstract class FrameBufferRenderer
 	protected abstract SKSurface UpdateSize(int width, int height);
 
 	protected abstract void PresentToOutput(int degrees, int transX, int transY);
+
+	/// <summary>
+	/// Partial redraw: the output surface a frame can be drawn into directly (no retained copy), null if none.
+	/// </summary>
+	protected virtual SKSurface? DirectSurface => null;
+
+	/// <summary>Presents a frame drawn into <see cref="DirectSurface"/>.</summary>
+	protected virtual void PresentDirect(int degrees, int transX, int transY)
+	{
+	}
 
 	public virtual void Dispose() { }
 }
@@ -265,5 +337,35 @@ internal static class CompositionTargetFrameSlot
 			frame = s_slot!.GetValue(target);
 		}
 		return frame is ITuple { Length: > 0 } tuple && tuple[0] is { } picture ? picture : s_empty;
+	}
+
+	/// <summary>Share of the frame area (logical units) covered by the damage area of the frame in the slot, 0 if unknown.</summary>
+	internal static double DamageFraction(CompositionTarget target, double frameArea)
+	{
+		if (!IsAvailable || frameArea <= 0 || s_gate!.GetValue(target) is not Lock gate)
+		{
+			return 0;
+		}
+		double damage = 0;
+		lock (gate)
+		{
+			if (s_slot!.GetValue(target) is not ITuple { Length: > 2 } tuple || tuple[2] is not SKPath path)
+			{
+				return 0;
+			}
+			// Real area, not the bounds: two small rects far apart are a small share
+			using var clip = new SKRegion(SKRectI.Ceiling(path.Bounds, true));
+			using var region = new SKRegion();
+			if (!region.SetPath(path, clip))
+			{
+				return 0;
+			}
+			using var rects = region.CreateRectIterator();
+			while (rects.Next(out var rect))
+			{
+				damage += (double)rect.Width * rect.Height;
+			}
+		}
+		return damage / frameArea;
 	}
 }

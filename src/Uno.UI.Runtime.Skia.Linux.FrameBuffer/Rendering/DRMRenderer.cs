@@ -497,6 +497,18 @@ namespace Uno.UI.Runtime.Skia
 		// Partial redraw needs to know which frame was drawn (see FrameBufferRenderer.Render)
 		protected override bool PartialRedraw => !s_fullRedraw && CompositionTargetFrameSlot.IsAvailable;
 
+		// Frames that change most of the screen skip the retained copy
+		protected override SKSurface? DirectSurface => PartialRedraw ? _glFbSurface : null;
+
+		protected override void PresentDirect(int degrees, int transX, int transY)
+		{
+			if (_glFbSurface is { } glFb)
+			{
+				DrawCursor(glFb.Canvas, degrees, transX, transY);
+				glFb.Canvas.Flush();
+			}
+		}
+
 		protected override void PresentToOutput(int degrees, int transX, int transY)
 		{
 			if (_surface is { } composition && _glFbSurface is { } glFb)
