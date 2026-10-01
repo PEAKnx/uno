@@ -325,7 +325,11 @@ namespace Uno.UI.Runtime.Skia
 				_renderRequested.Reset();
 				try
 				{
-					Render();
+					if (!Render())
+					{
+						// The frame on screen is still current
+						continue;
+					}
 					var bo = SwapBuffers();
 					_pageFlipDone.Wait();
 					if (_disposed)
@@ -469,10 +473,26 @@ namespace Uno.UI.Runtime.Skia
 			_renderTarget = new GRBackendRenderTarget(width, height, _samples, _stencil, glInfo);
 			_glFbSurface = SKSurface.Create(_grContext, _renderTarget, grSurfaceOrigin, SKColorType.Rgb888x);
 
-			// Every frame is a full redraw, so it is drawn straight into the scanout buffer
-			// instead of a retained surface that was copied to it (a full-screen blit per frame)
+			if (PartialRedraw)
+			{
+				// Retained frame, copied to the scanout buffer on present (the GBM buffers rotate)
+				return SKSurface.Create(_grContext, budgeted: true, new SKImageInfo(width, height, SKColorType.Rgba8888, SKAlphaType.Premul))
+					?? throw new InvalidOperationException("Failed to create the DRM retained composition surface.");
+			}
+
+			// A full redraw is drawn straight into the scanout buffer instead of a retained
+			// surface that was copied to it (a full-screen blit per frame)
 			return _glFbSurface ?? throw new InvalidOperationException("Failed to create the DRM framebuffer surface.");
 		}
+
+		// Partial redraw into a retained surface. Redrawing the full 1200x1920 frame cost about
+		// 17 ms of GPU time per frame on an Atom Z8350, so a small change (a camera image, a value) kept the GPU busy;
+		// the opaque copy to the scanout buffer costs a fraction of it. UNO_FRAMEBUFFER_FULL_REDRAW=1 disables it.
+		private static readonly bool s_fullRedraw = Environment.GetEnvironmentVariable("UNO_FRAMEBUFFER_FULL_REDRAW") == "1";
+		private static readonly SKPaint s_copyPaint = new() { BlendMode = SKBlendMode.Src };
+
+		// Partial redraw needs to know which frame was drawn (see FrameBufferRenderer.Render)
+		protected override bool PartialRedraw => !s_fullRedraw && CompositionTargetFrameSlot.IsAvailable;
 
 		protected override void PresentToOutput(int degrees, int transX, int transY)
 		{
@@ -480,7 +500,7 @@ namespace Uno.UI.Runtime.Skia
 			{
 				if (!ReferenceEquals(composition, glFb))
 				{
-					composition.Draw(glFb.Canvas, 0, 0, null);
+					composition.Draw(glFb.Canvas, 0, 0, s_copyPaint);
 				}
 				DrawCursor(glFb.Canvas, degrees, transX, transY);
 				glFb.Canvas.Flush();

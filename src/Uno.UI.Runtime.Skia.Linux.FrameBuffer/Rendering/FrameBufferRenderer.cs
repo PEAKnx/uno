@@ -1,4 +1,7 @@
 using System;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Threading;
 using Windows.Graphics.Display;
 using Windows.Graphics.Interop.Direct2D;
 using Microsoft.UI.Composition;
@@ -21,6 +24,13 @@ internal abstract class FrameBufferRenderer
 	private Size _surfaceSize;
 	private int _renderCount;
 	private bool _receivedMouseEvent;
+	// CompositionTarget draws its last frame again on every native frame request (the request is what schedules
+	// the next recording), also when nothing was recorded since: such a frame is not presented again
+	private object? _presentedFrame;
+	private Windows.Foundation.Point? _presentedCursor;
+	// Partial redraw: geometry of the retained frame, and the frame to redraw completely until a newer one was drawn
+	private (Windows.Graphics.SizeInt32 Bounds, DisplayOrientations Orientation, float Scale) _geometry;
+	private object? _redrawUntilNewerThan;
 
 	public readonly record struct MouseIndicatorOptions(bool? ShowMouseCursor, float MouseCursorRadius, System.Drawing.Color MouseCursorColor);
 
@@ -32,10 +42,19 @@ internal abstract class FrameBufferRenderer
 		_cursorVisible = mouseIndicatorOptions.ShowMouseCursor;
 		_receivedMouseEvent = FrameBufferPointerInputSource.Instance.ReceivedMouseEvent;
 		FrameBufferPointerInputSource.Instance.MouseEventReceived += OnMouseEventReceived;
-		// Every frame is redrawn and presented completely (Render passes no previous canvas), so the damage the
-		// render walk would compute is never used
-		Microsoft.UI.Composition.Visual.EnableDamageTracking = false;
+		// Partial redraw needs the damage of each frame; a full redraw never uses it
+		Microsoft.UI.Composition.Visual.EnableDamageTracking = PartialRedraw;
+		if (!CompositionTargetFrameSlot.IsAvailable)
+		{
+			this.LogWarn()?.Warn("CompositionTarget frame slot not found: full redraw, every frame is presented.");
+		}
 	}
+
+	/// <summary>
+	/// The renderer keeps the last frame in <see cref="_surface"/> and presents a copy of it: CompositionTarget then
+	/// redraws only the damaged region. Otherwise every frame is redrawn completely.
+	/// </summary>
+	protected virtual bool PartialRedraw => false;
 
 	private void OnMouseEventReceived()
 	{
@@ -43,7 +62,8 @@ internal abstract class FrameBufferRenderer
 		_receivedMouseEvent = true;
 	}
 
-	protected void Render()
+	/// <summary>Draws the current frame; returns false when there is nothing new to present.</summary>
+	protected bool Render()
 	{
 		if (this.Log().IsEnabled(LogLevel.Trace))
 		{
@@ -67,12 +87,78 @@ internal abstract class FrameBufferRenderer
 			DisplayOrientations.PortraitFlipped => (-90, 0, bounds.Width),
 			_ => throw new ArgumentOutOfRangeException()
 		};
+		// The frame CompositionTarget is about to draw, see Present
+		var slotBefore = CompositionTargetFrameSlot.Current(ct);
+		var recreated = false;
+
+		if (PartialRedraw)
+		{
+			// After a size, orientation or scale change the retained frame fits no frame recorded for the new layout (their
+			// unchanged parts are not in the damage): redraw completely until such a frame was drawn
+			var geometry = (bounds, orientation, FrameBufferWindowWrapper.Instance.RasterizationScale);
+			if (!_geometry.Equals(geometry))
+			{
+				_geometry = geometry;
+				_redrawUntilNewerThan = slotBefore;
+			}
+			var redraw = _redrawUntilNewerThan is not null;
+
+			// Otherwise the surface still holds the last frame: CompositionTarget clips this frame to its damage region
+			var canvas = redraw ? null : _surface?.Canvas;
+			canvas?.Save();
+			canvas?.Translate(transX, transY);
+			canvas?.RotateDegrees(degrees);
+			ct.OnNativePlatformFrameRequested(canvas, size =>
+			{
+				if (orientation is DisplayOrientations.Portrait or DisplayOrientations.PortraitFlipped)
+				{
+					size = new Size(size.Height, size.Width);
+				}
+				if (_surface is null || _surfaceSize != size)
+				{
+					_surface?.Dispose();
+					_surface = UpdateSize((int)size.Width, (int)size.Height);
+					_surfaceSize = size;
+					recreated = true;
+				}
+				_surface.Canvas.Save();
+				_surface.Canvas.Translate((float)transX, (float)transY);
+				_surface.Canvas.RotateDegrees(degrees);
+				return _surface.Canvas;
+			});
+			_surface?.Canvas.Restore();
+			_surface?.Flush();
+
+			var drawn = DrawnFrame(ct, slotBefore);
+			if (redraw && drawn is not null && !ReferenceEquals(drawn, _redrawUntilNewerThan))
+			{
+				_redrawUntilNewerThan = null;
+			}
+			return Present(drawn, recreated || redraw, degrees, transX, transY);
+		}
+
 		// Full redraw every frame: CompositionTarget clips the frame to the damage region when it gets the
 		// previous canvas, assuming the target still holds the last frame. The GBM buffers rotate (the back
-		// buffer holds an older frame), and the complex damage clip is expensive on weak GPUs. A null canvas
-		// makes it treat every frame as new; the surface itself is reused while the size stays the same.
-		ct.OnNativePlatformFrameRequested(null, size =>
+		// buffer holds an older frame). A null canvas makes it treat every frame as new; the surface itself is
+		// reused while the size stays the same.
+		// Redrawing the frame on screen is wasted: it is drawn clipped out instead (a frame published meanwhile is
+		// drawn on the render request that follows its publication). Partial redraw does not need this, as such a
+		// frame has no damage left.
+		var probe = slotBefore is not null && ReferenceEquals(slotBefore, _presentedFrame) && _surface is not null
+			&& CursorPosition == _presentedCursor;
+		if (probe)
 		{
+			_surface!.Canvas.Save();
+			_surface.Canvas.ClipRect(SKRect.Empty);
+		}
+		ct.OnNativePlatformFrameRequested(probe ? _surface!.Canvas : null, size =>
+		{
+			if (probe)
+			{
+				// The size changed: draw the frame
+				_surface!.Canvas.Restore();
+				probe = false;
+			}
 			if (orientation is DisplayOrientations.Portrait or DisplayOrientations.PortraitFlipped)
 			{
 				size = new Size(size.Height, size.Width);
@@ -82,6 +168,7 @@ internal abstract class FrameBufferRenderer
 				_surface?.Dispose();
 				_surface = UpdateSize((int)size.Width, (int)size.Height);
 				_surfaceSize = size;
+				recreated = true;
 			}
 			_surface.Canvas.Save();
 			_surface.Canvas.Translate((float)transX, (float)transY);
@@ -89,9 +176,39 @@ internal abstract class FrameBufferRenderer
 			return _surface.Canvas;
 		});
 		_surface?.Canvas.Restore();
+		if (probe)
+		{
+			// Nothing drawn (the output holds an older frame): a moved cursor needs a drawn frame
+			if (CursorPosition != _presentedCursor)
+			{
+				InvalidateRender();
+			}
+			return false;
+		}
 		_surface?.Flush();
 
+		return Present(DrawnFrame(ct, slotBefore), recreated, degrees, transX, transY);
+	}
+
+	private Windows.Foundation.Point? CursorPosition => ShouldShowCursor ? FrameBufferPointerInputSource.Instance.MousePosition : null;
+
+	// The frame drawn is known when the slot holds the same frame before and after drawing (one published in between
+	// would be in the slot after it), otherwise null: then this frame is presented and so is the next one
+	private static object? DrawnFrame(CompositionTarget ct, object? slotBefore)
+		=> slotBefore is not null && ReferenceEquals(slotBefore, CompositionTargetFrameSlot.Current(ct)) ? slotBefore : null;
+
+	private bool Present(object? drawn, bool recreated, int degrees, int transX, int transY)
+	{
+		var cursor = CursorPosition;
+		if (drawn is not null && ReferenceEquals(drawn, _presentedFrame) && !recreated && cursor == _presentedCursor)
+		{
+			return false;
+		}
+		_presentedFrame = drawn;
+		_presentedCursor = cursor;
+
 		PresentToOutput(degrees, transX, transY);
+		return true;
 	}
 
 	protected bool ShouldShowCursor => _cursorVisible ?? _receivedMouseEvent;
@@ -120,4 +237,33 @@ internal abstract class FrameBufferRenderer
 	protected abstract void PresentToOutput(int degrees, int transX, int transY);
 
 	public virtual void Dispose() { }
+}
+
+/// <summary>
+/// Identity of the frame CompositionTarget keeps for the next draw (its frame slot, read under its lock), so the host
+/// knows whether a draw was a frame it presented already. CompositionTarget has no API for this in this version, so
+/// the private fields are read by reflection (pinned Uno version). Without them every frame is presented, as before.
+/// </summary>
+internal static class CompositionTargetFrameSlot
+{
+	private static readonly FieldInfo? s_gate = typeof(CompositionTarget).GetField("_frameGate", BindingFlags.NonPublic | BindingFlags.Instance);
+	private static readonly FieldInfo? s_slot = typeof(CompositionTarget).GetField("_lastRenderedFrame", BindingFlags.NonPublic | BindingFlags.Instance);
+	private static readonly object s_empty = new();
+
+	internal static bool IsAvailable { get; } = s_gate?.FieldType == typeof(Lock) && s_slot is not null;
+
+	/// <summary>The frame in the slot (a placeholder when empty), null if unavailable.</summary>
+	internal static object? Current(CompositionTarget target)
+	{
+		if (!IsAvailable || s_gate!.GetValue(target) is not Lock gate)
+		{
+			return null;
+		}
+		object? frame;
+		lock (gate)
+		{
+			frame = s_slot!.GetValue(target);
+		}
+		return frame is ITuple { Length: > 0 } tuple && tuple[0] is { } picture ? picture : s_empty;
+	}
 }
