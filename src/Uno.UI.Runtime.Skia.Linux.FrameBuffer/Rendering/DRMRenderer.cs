@@ -259,6 +259,7 @@ namespace Uno.UI.Runtime.Skia
 				throw new NotSupportedException($"{nameof(GRContext)}.{nameof(GRContext.CreateGl)} failed");
 			}
 			_grContext = context;
+			FrameBufferGpu.Attach(this);
 
 			FrameBufferWindowWrapper.Instance.SetSize(new Size(modeInfo.Resolution.Width, modeInfo.Resolution.Height));
 
@@ -314,6 +315,8 @@ namespace Uno.UI.Runtime.Skia
 				{
 					return;
 				}
+				// App work on the render thread (FrameBufferGpu.TryInvoke)
+				FrameBufferGpu.RunPending(_grContext);
 				// The next frame is rendered while the previous page flip is still pending (one
 				// buffer on screen, one queued, one rendered), so CPU/GPU work overlaps the wait for vblank.
 				// Without a free GBM buffer it waits for the flip first, as before.
@@ -547,6 +550,7 @@ namespace Uno.UI.Runtime.Skia
 				return;
 			}
 			_disposed = true;
+			FrameBufferGpu.Detach(this);
 			// Wake the render loop so it exits
 			_renderRequested.Set();
 			_pageFlipDone.Set();
