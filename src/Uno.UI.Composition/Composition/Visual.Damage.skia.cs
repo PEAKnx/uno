@@ -25,6 +25,14 @@ public partial class Visual
 
 	internal virtual float DamageRegionSamplingMargin => 0;
 
+	/// <summary>
+	/// Whether the render walk tracks damage: the screen region that changed since the last frame, so a host can
+	/// present only that region. Computing it costs path operations for every visual on every frame. A host that
+	/// always redraws and presents the whole frame can switch it off; the walk then gets no damage path and also
+	/// skips the root-space clip paths that only feed it.
+	/// </summary>
+	internal static bool EnableDamageTracking { get; set; } = true;
+
 	private void ContributeDamageOnPaint(bool contentChanged, SKPath? damage, SKPath clip, bool clipChanged)
 	{
 		if (damage is null)

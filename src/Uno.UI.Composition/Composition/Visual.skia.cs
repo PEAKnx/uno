@@ -391,6 +391,11 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 			return;
 		}
 
+		if (!EnableDamageTracking)
+		{
+			damage = null;
+		}
+
 		// Since we're acting as if this visual is a root visual, we undo the parent's TotalMatrix
 		// so that when concatenated with this visual's TotalMatrix, the result is only the transforms
 		// from this visual.
@@ -469,6 +474,9 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 
 		CreateLocalSession(in parentSession, out var session);
 
+		// The root-space clips below only feed damage tracking
+		var trackDamage = session.Damage is not null;
+
 		// The clip in effect for this visual's own content (the inherited clip intersected with this visual's
 		// pre-painting clip) and for its children (additionally intersected with the post-painting clip),
 		// accumulated in root coordinates as we descend so each visual's total clip is computed once instead
@@ -482,23 +490,32 @@ public partial class Visual : global::Microsoft.UI.Composition.CompositionObject
 		{
 			var canvas = session.Canvas;
 
-			var toRoot = TotalMatrix.ToSKMatrix();
+			var toRoot = trackDamage ? TotalMatrix.ToSKMatrix() : default;
 
 			var preClip = _spareRenderPath;
 			preClip.Rewind();
 
 			ownClip.Rewind();
-			ownClip.AddPath(clipInRoot);
+			if (trackDamage)
+			{
+				ownClip.AddPath(clipInRoot);
+			}
 			if (GetPrePaintingClipping(preClip))
 			{
 				canvas.ClipPath(preClip, antialias: true);
-				preClip.TransformBy(toRoot);
-				ownClip.Op(preClip, SKPathOp.Intersect, ownClip);
+				if (trackDamage)
+				{
+					preClip.TransformBy(toRoot);
+					ownClip.Op(preClip, SKPathOp.Intersect, ownClip);
+				}
 			}
 
 			childClip.Rewind();
-			childClip.AddPath(ownClip);
-			if (GetPostPaintingClipping() is { } postClip)
+			if (trackDamage)
+			{
+				childClip.AddPath(ownClip);
+			}
+			if (trackDamage && GetPostPaintingClipping() is { } postClip)
 			{
 				var postClipInRoot = _pathPool.Allocate();
 				postClipInRoot.Rewind();
