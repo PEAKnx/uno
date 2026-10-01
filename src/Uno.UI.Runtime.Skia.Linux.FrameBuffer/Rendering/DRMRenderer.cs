@@ -298,6 +298,15 @@ namespace Uno.UI.Runtime.Skia
 
 		private void RenderLoop()
 		{
+			// Only this thread renders, so the context stays current here. Binding and releasing
+			// it around every frame (MakeCurrent) made the driver flush and revalidate its state each time.
+			if (!EglHelper.EglMakeCurrent(_eglDisplay, _eglSurface, _eglSurface, _glContext))
+			{
+				if (this.Log().IsEnabled(LogLevel.Error))
+				{
+					this.Log().Error($"{nameof(EglHelper.EglMakeCurrent)} failed on the render thread.");
+				}
+			}
 			while (true)
 			{
 				_renderRequested.WaitOne();
@@ -387,6 +396,11 @@ namespace Uno.UI.Runtime.Skia
 			var glContext = EglHelper.EglGetCurrentContext();
 			var readSurface = EglHelper.EglGetCurrentSurface(EglHelper.EGL_READ);
 			var drawSurface = EglHelper.EglGetCurrentSurface(EglHelper.EGL_DRAW);
+			// Already current (the render thread): nothing to bind or restore
+			if (glContext == _glContext && drawSurface == _eglSurface && readSurface == _eglSurface)
+			{
+				return Disposable.Empty;
+			}
 			if (!EglHelper.EglMakeCurrent(_eglDisplay, _eglSurface, _eglSurface, _glContext))
 			{
 				if (this.Log().IsEnabled(LogLevel.Error))
