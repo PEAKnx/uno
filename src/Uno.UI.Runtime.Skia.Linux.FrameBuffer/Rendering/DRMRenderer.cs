@@ -45,6 +45,7 @@ namespace Uno.UI.Runtime.Skia
 		private readonly AutoResetEvent _renderRequested = new(false);
 		private readonly ManualResetEventSlim _pageFlipDone = new(true);
 		private readonly GCHandle _selfHandle;
+		private readonly DRMBusyIndicator? _busyIndicator;
 
 		private LibDrm.drmModeCrtc _savedCrtc;
 		private uint _savedConnectorId;
@@ -245,6 +246,7 @@ namespace Uno.UI.Runtime.Skia
 			}
 
 			_currentBo = bo;
+			_busyIndicator = DRMBusyIndicator.TryStart(_card, _crtc, device, modeInfo.Resolution.Width, modeInfo.Resolution.Height, () => !_disposed);
 
 			var glInterface = GRGlInterface.CreateGles(EglHelper.EglGetProcAddress);
 
@@ -563,6 +565,7 @@ namespace Uno.UI.Runtime.Skia
 			}
 			_disposed = true;
 			FrameBufferGpu.Detach(this);
+			_busyIndicator?.Dispose();
 			// Wake the render loop so it exits
 			_renderRequested.Set();
 			_pageFlipDone.Set();
