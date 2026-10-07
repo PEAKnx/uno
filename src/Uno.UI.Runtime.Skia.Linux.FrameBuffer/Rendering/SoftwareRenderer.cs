@@ -38,7 +38,13 @@ namespace Uno.UI.Runtime.Skia
 						{
 							break;
 						}
-						Render();
+						var started = System.Diagnostics.Stopwatch.GetTimestamp();
+						if (Render())
+						{
+							// Same counters as the DRM renderer, for the performance overlay
+							Interlocked.Add(ref DRMDisplayPower.RenderTicksTotal, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+							Interlocked.Increment(ref DRMDisplayPower.PresentedFramesCount);
+						}
 					}
 					catch (Exception ex)
 					{
@@ -48,7 +54,7 @@ namespace Uno.UI.Runtime.Skia
 			})
 			{
 				IsBackground = true,
-				Name = "FrameBuffer software rendering thread"
+				Name = "FB render loop"
 			};
 			_renderThread.Start();
 		}

@@ -65,224 +65,264 @@ namespace Uno.UI.Runtime.Skia
 		{
 			_selfHandle = GCHandle.Alloc(this);
 
-			if (drmInitOptions.CardPath is not null)
-			{
-				_card = Libc.open(drmInitOptions.CardPath, Libc.O_RDWR, 0);
-				if (_card == -1)
-				{
-					var errno = Marshal.GetLastWin32Error();
-					var errnoStringPtr = Libc.strerror(errno);
-					var errorString = Marshal.PtrToStringAnsi(errnoStringPtr);
-					throw new InvalidOperationException($"Couldn't open {drmInitOptions.CardPath} ({errno}): {errorString}");
-				}
-				else
-				{
-					this.LogInfo()?.Info($"Found DRM device {drmInitOptions.CardPath}");
-				}
-			}
-			else
-			{
-				var files = Directory.GetFiles("/dev/dri/");
-
-				foreach (var file in files)
-				{
-					if (DRMCardPathRegex().Match(file).Success)
-					{
-						_card = Libc.open(file, Libc.O_RDWR, 0);
-						if (_card == -1)
-						{
-							var errno = Marshal.GetLastWin32Error();
-							var errnoStringPtr = Libc.strerror(errno);
-							var errorString = Marshal.PtrToStringAnsi(errnoStringPtr);
-							this.LogDebug()?.LogDebug($"Couldn't open {file} ({errno}): {errorString}");
-						}
-						else
-						{
-							this.LogInfo()?.Info($"Found DRM device {file}");
-							break;
-						}
-					}
-				}
-				if (_card == -1)
-				{
-					throw new FileNotFoundException("Couldn't open any DRM card matching /dev/dri/card[0-9]+");
-				}
-			}
-
-			var resources = new DrmResources(_card);
-			this.LogDebug()?.Debug($"DRM resources dump:\n{resources.Dump()}");
-
-			if (resources.Connectors.Count == 0)
-			{
-				throw new Exception("No DRM connectors found");
-			}
-
-			var connectors =
-				resources.Connectors
-				.Where(c => c is { Connection: DrmModeConnection.DRM_MODE_CONNECTED, Modes.Count: > 0 })
-				.ToList();
-			DrmConnector? connector = default;
-			if (drmInitOptions.DRMConnectorChooser is { } chooser)
-			{
-				var connectorsForChooser =
-					connectors
-						.Select(c => new FramebufferHostBuilder.DRMConnector((uint)c.ConnectorType, c.ConnectorTypeId, c.Id, c.Name))
-						.ToList();
-				if (chooser(connectorsForChooser) is var chosenConnectorIndex && connectorsForChooser.Count > chosenConnectorIndex && chosenConnectorIndex >= 0)
-				{
-					connector = connectors[chosenConnectorIndex];
-				}
-				else
-				{
-					throw new InvalidOperationException($"The connector chosen with {nameof(FramebufferHostBuilder.DRMConnectorChooser)} does not have a usable CRTC+encoder combination");
-				}
-			}
-			else
-			{
-				// We use the first connector that has a usable encoder+crtc combination
-				foreach (var connectorCandidate in connectors)
-				{
-					var encoderIds = resources.Encoders.Keys.AsEnumerable();
-					if (resources.Encoders.ContainsKey(connectorCandidate.EncoderId))
-					{
-						// if connector is already modeset to use a specific encoder, then let's try reusing it first
-						encoderIds = encoderIds.Prepend(connectorCandidate.EncoderId);
-					}
-					foreach (var encoderId in encoderIds)
-					{
-						var encoder = resources.Encoders[encoderId];
-						if (encoder.PossibleCrtcs.Any(crtc => crtc.crtc_id == encoder.Encoder.crtc_id))
-						{
-							connector = connectorCandidate;
-							_encoder = encoderId;
-							_crtc = encoder.Encoder.crtc_id;
-							break;
-						}
-						else if (encoder.PossibleCrtcs.Count > 0)
-						{
-							connector = connectorCandidate;
-							_encoder = encoderId;
-							// possible crtcs are ordered from best to worst
-							_crtc = encoder.PossibleCrtcs.First().crtc_id;
-							break;
-						}
-					}
-				}
-
-				if (connector is null)
-				{
-					throw new InvalidOperationException("Cannot find any connectors with a usable CRTC+encoder combination");
-				}
-			}
-
-			Debug.Assert(connector is not null && resources.Encoders[_encoder].PossibleCrtcs.Any(crtc => _crtc == crtc.crtc_id));
-
-			var modeInfo = connector.Modes.FirstOrDefault(m => m.IsPreferred, connector.Modes[0]);
-
-			var device = LibDrm.gbm_create_device(_card);
-			if (device == IntPtr.Zero)
-			{
-				throw new InvalidOperationException($"{nameof(LibDrm.gbm_create_device)} failed");
-			}
-			_gbmTargetSurface = LibDrm.gbm_surface_create(device, modeInfo.Resolution.Width, modeInfo.Resolution.Height, drmInitOptions.GBMSurfaceColorFormat.ToInt(), LibDrm.GbmBoFlags.GBM_BO_USE_SCANOUT | LibDrm.GbmBoFlags.GBM_BO_USE_RENDERING);
-			if (_gbmTargetSurface == IntPtr.Zero)
-			{
-				throw new InvalidOperationException($"{nameof(LibDrm.gbm_surface_create)} failed");
-			}
-
+			_card = OpenDisplayCard(drmInitOptions.CardPath);
 			try
 			{
-				_eglDisplay = EglHelper.EglGetPlatformDisplay(/* EGL_PLATFORM_GBM_KHR */ 0x31D7, device, null);
-				if (_eglDisplay == IntPtr.Zero)
+				var resources = new DrmResources(_card);
+				this.LogDebug()?.Debug($"DRM resources dump:\n{resources.Dump()}");
+
+				if (resources.Connectors.Count == 0)
 				{
-					throw new InvalidOperationException($"{nameof(EglHelper.EglGetPlatformDisplay)} failed : {Enum.GetName(EglHelper.EglGetError())}");
+					throw new Exception("No DRM connectors found");
 				}
-			}
-			catch (Exception e)
-			{
-				this.LogDebug()?.Debug(e.Message);
-				_eglDisplay = EglHelper.EglGetPlatformDisplayEXT(/* EGL_PLATFORM_GBM_KHR */ 0x31D7, device, null);
-				if (_eglDisplay == IntPtr.Zero)
+
+				var connectors =
+					resources.Connectors
+					.Where(c => c is { Connection: DrmModeConnection.DRM_MODE_CONNECTED, Modes.Count: > 0 })
+					.ToList();
+				DrmConnector? connector = default;
+				if (drmInitOptions.DRMConnectorChooser is { } chooser)
 				{
-					throw new InvalidOperationException($"{nameof(EglHelper.EglGetPlatformDisplayEXT)} failed : {Enum.GetName(EglHelper.EglGetError())}");
+					var connectorsForChooser =
+						connectors
+							.Select(c => new FramebufferHostBuilder.DRMConnector((uint)c.ConnectorType, c.ConnectorTypeId, c.Id, c.Name))
+							.ToList();
+					if (chooser(connectorsForChooser) is var chosenConnectorIndex && connectorsForChooser.Count > chosenConnectorIndex && chosenConnectorIndex >= 0)
+					{
+						connector = connectors[chosenConnectorIndex];
+					}
+					else
+					{
+						throw new InvalidOperationException($"The connector chosen with {nameof(FramebufferHostBuilder.DRMConnectorChooser)} does not have a usable CRTC+encoder combination");
+					}
 				}
-			}
-
-			(_eglSurface, _glContext, var major, var minor, _samples, _stencil)
-				= EglHelper.InitializeGles2Context(_eglDisplay, _gbmTargetSurface);
-			if (this.Log().IsEnabled(LogLevel.Information))
-			{
-				this.Log().Info($"Found EGL version {major}.{minor}.");
-			}
-
-			using var _ = MakeCurrent();
-
-			this.Log().Info($"Using {EglHelper.GetGlVersionString()} for rendering.");
-
-			if (!EglHelper.EglSwapBuffers(_eglDisplay, _eglSurface))
-			{
-				if (this.Log().IsEnabled(LogLevel.Error))
+				else
 				{
-					this.Log().Error($"{nameof(EglHelper.EglSwapBuffers)} failed during Renderer init: {Enum.GetName(EglHelper.EglGetError())}");
+					// We use the first connector that has a usable encoder+crtc combination
+					foreach (var connectorCandidate in connectors)
+					{
+						var encoderIds = resources.Encoders.Keys.AsEnumerable();
+						if (resources.Encoders.ContainsKey(connectorCandidate.EncoderId))
+						{
+							// if connector is already modeset to use a specific encoder, then let's try reusing it first
+							encoderIds = encoderIds.Prepend(connectorCandidate.EncoderId);
+						}
+						foreach (var encoderId in encoderIds)
+						{
+							var encoder = resources.Encoders[encoderId];
+							if (encoder.PossibleCrtcs.Any(crtc => crtc.crtc_id == encoder.Encoder.crtc_id))
+							{
+								connector = connectorCandidate;
+								_encoder = encoderId;
+								_crtc = encoder.Encoder.crtc_id;
+								break;
+							}
+							else if (encoder.PossibleCrtcs.Count > 0)
+							{
+								connector = connectorCandidate;
+								_encoder = encoderId;
+								// possible crtcs are ordered from best to worst
+								_crtc = encoder.PossibleCrtcs.First().crtc_id;
+								break;
+							}
+						}
+					}
+
+					if (connector is null)
+					{
+						throw new InvalidOperationException("Cannot find any connectors with a usable CRTC+encoder combination");
+					}
 				}
-			}
 
-			var bo = LibDrm.gbm_surface_lock_front_buffer(_gbmTargetSurface);
-			if (bo == IntPtr.Zero)
-			{
-				throw new InvalidOperationException($"{nameof(LibDrm.gbm_surface_lock_front_buffer)} failed during DRM CRTC setup.");
-			}
-			var fbId = CreateFbForBo(bo);
-			var connectorId = connector.Id;
-			var mode = modeInfo.Mode;
+				Debug.Assert(connector is not null && resources.Encoders[_encoder].PossibleCrtcs.Any(crtc => _crtc == crtc.crtc_id));
 
-			// Save the current CRTC state so we can restore it on exit, which allows
-			// the kernel fbcon to reattach and the CLI prompt to reappear.
-			var savedCrtc = LibDrm.drmModeGetCrtc(_card, _crtc);
-			if (savedCrtc != null)
-			{
-				_savedCrtc = *savedCrtc;
-				_savedConnectorId = connectorId;
-				LibDrm.drmModeFreeCrtc(savedCrtc);
-			}
+				var modeInfo = connector.Modes.FirstOrDefault(m => m.IsPreferred, connector.Modes[0]);
 
-			var res = LibDrm.drmModeSetCrtc(_card, _crtc, fbId, 0, 0, &connectorId, 1, &mode);
-			if (res != 0)
-			{
-				throw new InvalidOperationException($"{nameof(LibDrm.drmModeSetCrtc)} failed with error code {res}");
-			}
-
-			_currentBo = bo;
-			_connectorId = connectorId;
-			_dpmsPropertyId = FindConnectorProperty(connectorId, "DPMS");
-			DRMDisplayPower.Renderer = this;
-			_busyIndicator = DRMBusyIndicator.TryStart(_card, _crtc, device, modeInfo.Resolution.Width, modeInfo.Resolution.Height, () =>
-			{
-				lock (_powerLock)
+				var device = LibDrm.gbm_create_device(_card);
+				if (device == IntPtr.Zero)
 				{
-					return !_displayOff && !_disposed;
+					throw new InvalidOperationException($"{nameof(LibDrm.gbm_create_device)} failed");
 				}
-			});
+				_gbmTargetSurface = LibDrm.gbm_surface_create(device, modeInfo.Resolution.Width, modeInfo.Resolution.Height, drmInitOptions.GBMSurfaceColorFormat.ToInt(), LibDrm.GbmBoFlags.GBM_BO_USE_SCANOUT | LibDrm.GbmBoFlags.GBM_BO_USE_RENDERING);
+				if (_gbmTargetSurface == IntPtr.Zero)
+				{
+					throw new InvalidOperationException($"{nameof(LibDrm.gbm_surface_create)} failed");
+				}
 
-			var glInterface = GRGlInterface.CreateGles(EglHelper.EglGetProcAddress);
+				try
+				{
+					_eglDisplay = EglHelper.EglGetPlatformDisplay(/* EGL_PLATFORM_GBM_KHR */ 0x31D7, device, null);
+					if (_eglDisplay == IntPtr.Zero)
+					{
+						throw new InvalidOperationException($"{nameof(EglHelper.EglGetPlatformDisplay)} failed : {Enum.GetName(EglHelper.EglGetError())}");
+					}
+				}
+				catch (Exception e)
+				{
+					this.LogDebug()?.Debug(e.Message);
+					_eglDisplay = EglHelper.EglGetPlatformDisplayEXT(/* EGL_PLATFORM_GBM_KHR */ 0x31D7, device, null);
+					if (_eglDisplay == IntPtr.Zero)
+					{
+						throw new InvalidOperationException($"{nameof(EglHelper.EglGetPlatformDisplayEXT)} failed : {Enum.GetName(EglHelper.EglGetError())}");
+					}
+				}
 
-			if (glInterface == null)
+				(_eglSurface, _glContext, var major, var minor, _samples, _stencil)
+					= EglHelper.InitializeGles2Context(_eglDisplay, _gbmTargetSurface);
+				if (this.Log().IsEnabled(LogLevel.Information))
+				{
+					this.Log().Info($"Found EGL version {major}.{minor}.");
+				}
+
+				using var _ = MakeCurrent();
+
+				this.Log().Info($"Using {EglHelper.GetGlVersionString()} for rendering.");
+
+				if (!EglHelper.EglSwapBuffers(_eglDisplay, _eglSurface))
+				{
+					if (this.Log().IsEnabled(LogLevel.Error))
+					{
+						this.Log().Error($"{nameof(EglHelper.EglSwapBuffers)} failed during Renderer init: {Enum.GetName(EglHelper.EglGetError())}");
+					}
+				}
+
+				var bo = LibDrm.gbm_surface_lock_front_buffer(_gbmTargetSurface);
+				if (bo == IntPtr.Zero)
+				{
+					throw new InvalidOperationException($"{nameof(LibDrm.gbm_surface_lock_front_buffer)} failed during DRM CRTC setup.");
+				}
+				var fbId = CreateFbForBo(bo);
+				var connectorId = connector.Id;
+				var mode = modeInfo.Mode;
+
+				// Save the current CRTC state so we can restore it on exit, which allows
+				// the kernel fbcon to reattach and the CLI prompt to reappear.
+				var savedCrtc = LibDrm.drmModeGetCrtc(_card, _crtc);
+				if (savedCrtc != null)
+				{
+					_savedCrtc = *savedCrtc;
+					_savedConnectorId = connectorId;
+					LibDrm.drmModeFreeCrtc(savedCrtc);
+				}
+
+				var res = LibDrm.drmModeSetCrtc(_card, _crtc, fbId, 0, 0, &connectorId, 1, &mode);
+				if (res != 0)
+				{
+					throw new InvalidOperationException($"{nameof(LibDrm.drmModeSetCrtc)} failed with error code {res}");
+				}
+
+				_currentBo = bo;
+				_connectorId = connectorId;
+				_dpmsPropertyId = FindConnectorProperty(connectorId, "DPMS");
+				DRMDisplayPower.Renderer = this;
+				_busyIndicator = DRMBusyIndicator.TryStart(_card, _crtc, device, modeInfo.Resolution.Width, modeInfo.Resolution.Height, () =>
+				{
+					lock (_powerLock)
+					{
+						return !_displayOff && !_disposed;
+					}
+				});
+
+				var glInterface = GRGlInterface.CreateGles(EglHelper.EglGetProcAddress);
+
+				if (glInterface == null)
+				{
+					throw new NotSupportedException($"{nameof(GRGlInterface)}.{nameof(GRGlInterface.CreateGles)} failed");
+				}
+
+				var context = GRContext.CreateGl(glInterface);
+				if (context == null)
+				{
+					throw new NotSupportedException($"{nameof(GRContext)}.{nameof(GRContext.CreateGl)} failed");
+				}
+				_grContext = context;
+				FrameBufferGpu.Attach(this);
+
+				FrameBufferWindowWrapper.Instance.SetSize(new Size(modeInfo.Resolution.Width, modeInfo.Resolution.Height));
+
+				new Thread(PageFlipLoop) { IsBackground = true, Name = "DRM pageflip loop" }.Start();
+				new Thread(RenderLoop) { IsBackground = true, Name = "DRM render loop" }.Start();
+			}
+			catch
 			{
-				throw new NotSupportedException($"{nameof(GRGlInterface)}.{nameof(GRGlInterface.CreateGles)} failed");
+				// The fallback to software rendering must not keep the card open (this process would stay DRM master)
+				_busyIndicator?.Dispose();
+				if (DRMDisplayPower.Renderer == this)
+				{
+					DRMDisplayPower.Renderer = null;
+				}
+				FrameBufferGpu.Detach(this);
+				_selfHandle.Free();
+				Libc.close(_card);
+				throw;
+			}
+		}
+
+		/// <summary>
+		/// Opens <paramref name="path"/>, or the first /dev/dri/card* with a connected connector that has a mode and an
+		/// encoder: cards without a display (a GPU-only card, HDMI without a monitor) are skipped, with the reason logged.
+		/// </summary>
+		private int OpenDisplayCard(string? path)
+		{
+			if (path is not null)
+			{
+				var fd = Libc.open(path, Libc.O_RDWR, 0);
+				if (fd == -1)
+				{
+					var errno = Marshal.GetLastWin32Error();
+					var errorString = Marshal.PtrToStringAnsi(Libc.strerror(errno));
+					_selfHandle.Free();
+					throw new InvalidOperationException($"Couldn't open {path} ({errno}): {errorString}");
+				}
+				this.LogInfo()?.Info($"Found DRM device {path}");
+				return fd;
 			}
 
-			var context = GRContext.CreateGl(glInterface);
-			if (context == null)
+			var reasons = new System.Collections.Generic.List<string>();
+			foreach (var file in Directory.GetFiles("/dev/dri/").Where(f => DRMCardPathRegex().IsMatch(Path.GetFileName(f))).OrderBy(f => f, StringComparer.Ordinal))
 			{
-				throw new NotSupportedException($"{nameof(GRContext)}.{nameof(GRContext.CreateGl)} failed");
+				var fd = Libc.open(file, Libc.O_RDWR, 0);
+				if (fd == -1)
+				{
+					var errno = Marshal.GetLastWin32Error();
+					reasons.Add($"{file}: cannot open ({errno}: {Marshal.PtrToStringAnsi(Libc.strerror(errno))})");
+					continue;
+				}
+
+				string? reason;
+				try
+				{
+					reason = DescribeUnusable(new DrmResources(fd));
+				}
+				catch (Exception e)
+				{
+					reason = $"no DRM resources ({e.Message})";
+				}
+
+				if (reason is null)
+				{
+					this.LogInfo()?.Info($"Found DRM device {file}" + (reasons.Count > 0 ? $" (skipped: {string.Join("; ", reasons)})" : ""));
+					return fd;
+				}
+				reasons.Add($"{file}: {reason}");
+				Libc.close(fd);
 			}
-			_grContext = context;
-			FrameBufferGpu.Attach(this);
+			_selfHandle.Free();
+			throw new FileNotFoundException($"No DRM card with a connected display found ({(reasons.Count > 0 ? string.Join("; ", reasons) : "no /dev/dri/card* device")})");
+		}
 
-			FrameBufferWindowWrapper.Instance.SetSize(new Size(modeInfo.Resolution.Width, modeInfo.Resolution.Height));
-
-			new Thread(PageFlipLoop) { IsBackground = true, Name = "DRM pageflip loop" }.Start();
-			new Thread(RenderLoop) { IsBackground = true, Name = "DRM render loop" }.Start();
+		// Null if the card drives a connected display, else why not
+		private static string? DescribeUnusable(DrmResources resources)
+		{
+			if (resources.Connectors.Count == 0)
+			{
+				return "no connectors";
+			}
+			if (!resources.Connectors.Any(c => c is { Connection: DrmModeConnection.DRM_MODE_CONNECTED, Modes.Count: > 0 }))
+			{
+				return "no connected connector";
+			}
+			return resources.Encoders.Count == 0 ? "no encoder" : null;
 		}
 
 		private unsafe int CalculateRefreshRate(LibDrm.drmModeModeInfo* mode)
