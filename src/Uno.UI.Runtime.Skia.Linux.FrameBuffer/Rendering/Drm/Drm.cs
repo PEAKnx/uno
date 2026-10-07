@@ -1,4 +1,4 @@
-// Modified by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
+﻿// Modified by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
 using System;
 using System.Runtime.InteropServices;
 using Windows.Foundation;
@@ -222,6 +222,17 @@ namespace Uno.UI.Runtime.Skia
 
 		[DllImport(libgbm)]
 		public static extern IntPtr gbm_create_device(int fd);
+
+		/// <summary>Exports the buffer as a dma-buf file descriptor (to be closed by the caller), -1 on failure.</summary>
+		[DllImport(libgbm, SetLastError = true)]
+		public static extern int gbm_bo_get_fd(IntPtr bo);
+
+		/// <summary>Imports a dma-buf as a GEM handle of the device <paramref name="fd"/>.</summary>
+		[DllImport(libdrm, SetLastError = true)]
+		public static extern int drmPrimeFDToHandle(int fd, int primeFd, out uint handle);
+
+		[DllImport(libdrm, SetLastError = true)]
+		public static extern int drmCloseBufferHandle(int fd, uint handle);
 
 
 		[Flags]

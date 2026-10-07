@@ -36,6 +36,9 @@ namespace Uno.UI.Runtime.Skia
 		private SKSurface? _glFbSurface;
 		private readonly IntPtr _gbmTargetSurface;
 		private readonly int _card;
+		// Split mode (UNO_FRAMEBUFFER_RENDER_NODE): GBM/EGL render on this GPU render node, the buffers are imported
+		// into the display card (_card) for scanout. -1: the display card renders as well.
+		private int _renderFd = -1;
 		private IntPtr _currentBo;
 		// Buffer of the page flip in flight; _currentBo stays on screen until it completes
 		private IntPtr _pendingBo;
@@ -138,12 +141,25 @@ namespace Uno.UI.Runtime.Skia
 
 				var modeInfo = connector.Modes.FirstOrDefault(m => m.IsPreferred, connector.Modes[0]);
 
-				var device = LibDrm.gbm_create_device(_card);
+				var renderNode = Environment.GetEnvironmentVariable("UNO_FRAMEBUFFER_RENDER_NODE");
+				if (!string.IsNullOrEmpty(renderNode))
+				{
+					_renderFd = Libc.open(renderNode, Libc.O_RDWR, 0);
+					if (_renderFd == -1)
+					{
+						throw new InvalidOperationException($"Couldn't open the render node {renderNode} ({Marshal.GetLastWin32Error()})");
+					}
+					this.LogInfo()?.Info($"Rendering on {renderNode}, scanout on the display card");
+				}
+				var device = LibDrm.gbm_create_device(_renderFd != -1 ? _renderFd : _card);
 				if (device == IntPtr.Zero)
 				{
 					throw new InvalidOperationException($"{nameof(LibDrm.gbm_create_device)} failed");
 				}
-				_gbmTargetSurface = LibDrm.gbm_surface_create(device, modeInfo.Resolution.Width, modeInfo.Resolution.Height, drmInitOptions.GBMSurfaceColorFormat.ToInt(), LibDrm.GbmBoFlags.GBM_BO_USE_SCANOUT | LibDrm.GbmBoFlags.GBM_BO_USE_RENDERING);
+				_gbmTargetSurface = LibDrm.gbm_surface_create(device, modeInfo.Resolution.Width, modeInfo.Resolution.Height, drmInitOptions.GBMSurfaceColorFormat.ToInt(), _renderFd != -1
+					// Not allocated for scanout: the display card imports the buffer, which must be linear for it
+					? LibDrm.GbmBoFlags.GBM_BO_USE_RENDERING | LibDrm.GbmBoFlags.GBM_BO_USE_LINEAR
+					: LibDrm.GbmBoFlags.GBM_BO_USE_SCANOUT | LibDrm.GbmBoFlags.GBM_BO_USE_RENDERING);
 				if (_gbmTargetSurface == IntPtr.Zero)
 				{
 					throw new InvalidOperationException($"{nameof(LibDrm.gbm_surface_create)} failed");
@@ -171,7 +187,7 @@ namespace Uno.UI.Runtime.Skia
 					= EglHelper.InitializeGles2Context(_eglDisplay, _gbmTargetSurface);
 				if (this.Log().IsEnabled(LogLevel.Information))
 				{
-					this.Log().Info($"Found EGL version {major}.{minor}.");
+					this.Log().Info($"Found EGL version {major}.{minor}, {_samples} samples, {_stencil} stencil bits.");
 				}
 
 				using var _ = MakeCurrent();
@@ -215,7 +231,8 @@ namespace Uno.UI.Runtime.Skia
 				_connectorId = connectorId;
 				_dpmsPropertyId = FindConnectorProperty(connectorId, "DPMS");
 				DRMDisplayPower.Renderer = this;
-				_busyIndicator = DRMBusyIndicator.TryStart(_card, _crtc, device, modeInfo.Resolution.Width, modeInfo.Resolution.Height, () =>
+				// Needs cursor buffers of the display card: not available while another device renders
+				_busyIndicator = _renderFd != -1 ? null : DRMBusyIndicator.TryStart(_card, _crtc, device, modeInfo.Resolution.Width, modeInfo.Resolution.Height, () =>
 				{
 					lock (_powerLock)
 					{
@@ -230,7 +247,14 @@ namespace Uno.UI.Runtime.Skia
 					throw new NotSupportedException($"{nameof(GRGlInterface)}.{nameof(GRGlInterface.CreateGles)} failed");
 				}
 
-				var context = GRContext.CreateGl(glInterface);
+				// Diagnostics: UNO_FRAMEBUFFER_GR_OPTIONS=nostencil,nopathcache
+				var grOptions = Environment.GetEnvironmentVariable("UNO_FRAMEBUFFER_GR_OPTIONS") ?? "";
+				var context = GRContext.CreateGl(glInterface, new GRContextOptions
+				{
+					AvoidStencilBuffers = grOptions.Contains("nostencil"),
+					AllowPathMaskCaching = !grOptions.Contains("nopathcache"),
+					BufferMapThreshold = grOptions.Contains("nomap") ? int.MaxValue : -1,
+				});
 				if (context == null)
 				{
 					throw new NotSupportedException($"{nameof(GRContext)}.{nameof(GRContext.CreateGl)} failed");
@@ -254,6 +278,10 @@ namespace Uno.UI.Runtime.Skia
 				FrameBufferGpu.Detach(this);
 				_selfHandle.Free();
 				Libc.close(_card);
+				if (_renderFd != -1)
+				{
+					Libc.close(_renderFd);
+				}
 				throw;
 			}
 		}
@@ -399,15 +427,31 @@ namespace Uno.UI.Runtime.Skia
 							// The frame on screen is still current
 							continue;
 						}
+						if (s_trace)
+						{
+							// Separates the GPU time of the frame from the swap
+							using var current = MakeCurrent();
+							var finishStart = Stopwatch.GetTimestamp();
+							_grContext.Flush(true, true);
+							_traceFinish += Stopwatch.GetTimestamp() - finishStart;
+						}
+						DumpFrame();
+						var rendered = Stopwatch.GetTimestamp();
 						var bo = SwapBuffers();
-						Interlocked.Add(ref DRMDisplayPower.RenderTicksTotal, Stopwatch.GetTimestamp() - started);
+						var swapped = Stopwatch.GetTimestamp();
+						Interlocked.Add(ref DRMDisplayPower.RenderTicksTotal, swapped - started);
 						_pageFlipDone.Wait();
 						if (_disposed)
 						{
 							return;
 						}
+						var waited = Stopwatch.GetTimestamp();
 						PageFlip(bo);
 						Interlocked.Increment(ref DRMDisplayPower.PresentedFramesCount);
+						if (s_trace)
+						{
+							TraceFrame(started, rendered, swapped, waited, Stopwatch.GetTimestamp());
+						}
 					}
 					catch (Exception e)
 					{
@@ -423,6 +467,70 @@ namespace Uno.UI.Runtime.Skia
 					}
 				}
 			}
+		}
+
+		// UNO_FRAMEBUFFER_DUMP=<file.png>: the frame about to be presented is saved at most every 2 s (screenshot of the
+		// DRM path, which does not write to /dev/fb0)
+		private static readonly string? s_dumpPath = Environment.GetEnvironmentVariable("UNO_FRAMEBUFFER_DUMP");
+		private long _dumpAt;
+
+		private void DumpFrame()
+		{
+			if (string.IsNullOrEmpty(s_dumpPath) || _glFbSurface is null || Stopwatch.GetTimestamp() - _dumpAt < 2 * Stopwatch.Frequency)
+			{
+				return;
+			}
+			_dumpAt = Stopwatch.GetTimestamp();
+			try
+			{
+				using var current = MakeCurrent();
+				Save(_glFbSurface, s_dumpPath);
+				if (_surface is { } composition && !ReferenceEquals(composition, _glFbSurface))
+				{
+					// The retained frame, to tell a wrong composition from a wrong presentation
+					Save(composition, Path.ChangeExtension(s_dumpPath, ".retained.png"));
+				}
+			}
+			catch (Exception e)
+			{
+				this.LogWarn()?.Warn($"Saving the frame to {s_dumpPath} failed: {e.Message}");
+			}
+		}
+
+		private static void Save(SKSurface surface, string path)
+		{
+			using var image = surface.Snapshot();
+			using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+			var temp = path + ".tmp";
+			using (var file = File.Create(temp))
+			{
+				data.SaveTo(file);
+			}
+			File.Move(temp, path, true);
+		}
+
+		// UNO_FRAMEBUFFER_TRACE=1: average time per step of the frames presented in each second, in the log
+		private static readonly bool s_trace = Environment.GetEnvironmentVariable("UNO_FRAMEBUFFER_TRACE") == "1";
+		private long _traceSince = Stopwatch.GetTimestamp();
+		private int _traceFrames;
+		private long _traceRender, _traceSwap, _traceFlipWait, _traceFlip, _traceFinish;
+
+		private void TraceFrame(long started, long rendered, long swapped, long waited, long flipped)
+		{
+			_traceFrames++;
+			_traceRender += rendered - started;
+			_traceSwap += swapped - rendered;
+			_traceFlipWait += waited - swapped;
+			_traceFlip += flipped - waited;
+			if (flipped - _traceSince < Stopwatch.Frequency)
+			{
+				return;
+			}
+			double ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency / _traceFrames;
+			this.LogInfo()?.Info($"DRM frames: {_traceFrames}/s, render {ms(_traceRender):0.0} ms, swap {ms(_traceSwap):0.0} ms, flip wait {ms(_traceFlipWait):0.0} ms, flip call {ms(_traceFlip):0.0} ms, finish {ms(_traceFinish):0.0} ms");
+			_traceSince = flipped;
+			_traceFrames = 0;
+			_traceRender = _traceSwap = _traceFlipWait = _traceFlip = _traceFinish = 0;
 		}
 
 		/// <summary>Switches the display off (DPMS) or on; rendering pauses while off, a new frame is presented on wake.</summary>
@@ -673,8 +781,27 @@ namespace Uno.UI.Runtime.Skia
 			var w = LibDrm.gbm_bo_get_width(bo);
 			var h = LibDrm.gbm_bo_get_height(bo);
 			var stride = LibDrm.gbm_bo_get_stride(bo);
-			var handle = LibDrm.gbm_bo_get_handle(bo).u32;
 			var format = LibDrm.gbm_bo_get_format(bo);
+			uint handle;
+			if (_renderFd != -1)
+			{
+				// Buffer of the render device: import it into the display card through a dma-buf
+				var prime = LibDrm.gbm_bo_get_fd(bo);
+				if (prime < 0)
+				{
+					throw new InvalidOperationException($"{nameof(LibDrm.gbm_bo_get_fd)} failed");
+				}
+				var imported = LibDrm.drmPrimeFDToHandle(_card, prime, out handle);
+				Libc.close(prime);
+				if (imported != 0)
+				{
+					throw new InvalidOperationException($"{nameof(LibDrm.drmPrimeFDToHandle)} failed ({imported}, errno {Marshal.GetLastWin32Error()})");
+				}
+			}
+			else
+			{
+				handle = LibDrm.gbm_bo_get_handle(bo).u32;
+			}
 
 			// prepare for the new ioctl call
 			var handles = new uint[] { handle, 0, 0, 0 };
@@ -685,7 +812,15 @@ namespace Uno.UI.Runtime.Skia
 				offsets, out var fbHandle, 0);
 			if (ret != 0)
 			{
+				if (_renderFd != -1)
+				{
+					LibDrm.drmCloseBufferHandle(_card, handle);
+				}
 				throw new InvalidOperationException($"{nameof(LibDrm.drmModeAddFB2)} failed {ret}");
+			}
+			if (_renderFd != -1)
+			{
+				_importedHandles[fbHandle] = handle;
 			}
 
 			LibDrm.gbm_bo_set_user_data(bo, new IntPtr((int)fbHandle), OnBoFree);
@@ -693,7 +828,17 @@ namespace Uno.UI.Runtime.Skia
 			return fbHandle;
 		}
 
-		private void OnBoFree(IntPtr bo, IntPtr fbHandle) => LibDrm.drmModeRmFB(_card, fbHandle.ToInt32());
+		// GEM handles imported into the display card, by framebuffer id
+		private readonly System.Collections.Concurrent.ConcurrentDictionary<uint, uint> _importedHandles = new();
+
+		private void OnBoFree(IntPtr bo, IntPtr fbHandle)
+		{
+			LibDrm.drmModeRmFB(_card, fbHandle.ToInt32());
+			if (_importedHandles.TryRemove((uint)fbHandle.ToInt32(), out var handle))
+			{
+				LibDrm.drmCloseBufferHandle(_card, handle);
+			}
+		}
 
 		public override unsafe void Dispose()
 		{
