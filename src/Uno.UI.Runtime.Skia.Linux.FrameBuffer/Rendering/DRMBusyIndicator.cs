@@ -11,8 +11,9 @@ namespace Uno.UI.Runtime.Skia
 	/// <summary>
 	/// Busy indicator for a blocked UI thread on the DRM host. Layout, bindings and frame recording all run on the UI
 	/// thread, so while it is busy (e.g. creating a page) no frame is recorded and app animations stand still. The
-	/// render thread does not depend on it: it draws the last recorded frame again with a spinner on a dark disc on top,
-	/// which also hides a spinner of the app itself at the center of the screen (it would stand still or stutter).
+	/// render thread does not depend on it: it draws the last recorded frame again with a spinner on a dark disc on top
+	/// (just the size of the spinner). An app that shows its own loading state can force it (<see cref="FrameBufferBusyIndicator"/>)
+	/// and hide its spinner, so the two never alternate.
 	/// Opt-in: UNO_FRAMEBUFFER_BUSY_INDICATOR=&lt;ms&gt; shows it when the UI thread did not answer for that long;
 	/// UNO_FRAMEBUFFER_BUSY_INDICATOR_COLOR=#RRGGBB sets the arc color (a saturated color reads on light and dark pages).
 	/// </summary>
@@ -25,9 +26,9 @@ namespace Uno.UI.Runtime.Skia
 		private const int ProbeMs = 50;
 		// One revolution of the arc
 		private const int RevolutionMs = 1100;
-		// Disc and ring relative to the shorter display side: the disc covers a 200 dp ring of the app (0.17 on a 1200 px
-		// display at scale 2), drawn a little above the center like the app's spinner above its text
-		private const float DiscRadius = 0.19f;
+		// Disc relative to the shorter display side, just around the ring; drawn a little above the center like the app's
+		// spinner above its text
+		private const float DiscRadius = 0.15f;
 		private const float CenterUp = 0.06f;
 
 		private readonly long _delayTicks;
@@ -99,8 +100,8 @@ namespace Uno.UI.Runtime.Skia
 			var radius = shorter * DiscRadius;
 			var cx = uiWidth / 2f;
 			var cy = uiHeight / 2f - shorter * CenterUp;
-			var stroke = radius * 0.13f;
-			var ring = radius * 0.62f;
+			var stroke = radius * 0.165f;
+			var ring = radius * 0.79f;
 			var phase = Stopwatch.GetTimestamp() * 1000 / Stopwatch.Frequency % RevolutionMs * 360f / RevolutionMs;
 
 			canvas.Save();
