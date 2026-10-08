@@ -26,9 +26,10 @@ namespace Uno.UI.Runtime.Skia
 		private const int ProbeMs = 50;
 		// One revolution of the arc
 		private const int RevolutionMs = 1100;
-		// Disc relative to the shorter display side, just around the ring; drawn a little above the center like the app's
-		// spinner above its text
-		private const float DiscRadius = 0.15f;
+		// Ring and stroke relative to the shorter display side; the filled disc ends at the outer edge of the ring. Drawn a
+		// little above the center like the app's spinner above its text
+		private const float RingRadius = 0.12f;
+		private const float StrokeWidth = 0.025f;
 		private const float CenterUp = 0.06f;
 
 		private readonly long _delayTicks;
@@ -36,7 +37,6 @@ namespace Uno.UI.Runtime.Skia
 		private readonly Func<bool> _displayOn;
 		private readonly Thread _thread;
 		private readonly SKPaint _disc = new() { IsAntialias = true, Style = SKPaintStyle.Fill, Color = new SKColor(0x1c, 0x1c, 0x1e, 0xf5) };
-		private readonly SKPaint _border = new() { IsAntialias = true, Style = SKPaintStyle.Stroke, Color = new SKColor(0xff, 0xff, 0xff, 0x28) };
 		private readonly SKPaint _track = new() { IsAntialias = true, Style = SKPaintStyle.Stroke, Color = new SKColor(0xff, 0xff, 0xff, 0x24) };
 		private readonly SKPaint _arc;
 		private static volatile DRMBusyIndicator? s_current;
@@ -97,19 +97,17 @@ namespace Uno.UI.Runtime.Skia
 			var uiWidth = degrees is 90 or -90 ? height : width;
 			var uiHeight = degrees is 90 or -90 ? width : height;
 			var shorter = Math.Min(uiWidth, uiHeight);
-			var radius = shorter * DiscRadius;
 			var cx = uiWidth / 2f;
 			var cy = uiHeight / 2f - shorter * CenterUp;
-			var stroke = radius * 0.165f;
-			var ring = radius * 0.79f;
+			var stroke = shorter * StrokeWidth;
+			var ring = shorter * RingRadius;
+			var radius = ring + stroke / 2;
 			var phase = Stopwatch.GetTimestamp() * 1000 / Stopwatch.Frequency % RevolutionMs * 360f / RevolutionMs;
 
 			canvas.Save();
 			canvas.Translate(transX, transY);
 			canvas.RotateDegrees(degrees);
 			canvas.DrawCircle(cx, cy, radius, _disc);
-			_border.StrokeWidth = Math.Max(1, radius / 50);
-			canvas.DrawCircle(cx, cy, radius - _border.StrokeWidth / 2, _border);
 			_track.StrokeWidth = stroke;
 			canvas.DrawCircle(cx, cy, ring, _track);
 			_arc.StrokeWidth = stroke;
@@ -163,7 +161,6 @@ namespace Uno.UI.Runtime.Skia
 			}
 			_showing = false;
 			_disc.Dispose();
-			_border.Dispose();
 			_track.Dispose();
 			_arc.Dispose();
 		}
