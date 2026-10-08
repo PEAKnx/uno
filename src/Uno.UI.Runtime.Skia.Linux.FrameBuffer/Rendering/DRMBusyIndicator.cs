@@ -1,4 +1,4 @@
-// Added by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
+﻿// Added by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -57,9 +57,10 @@ namespace Uno.UI.Runtime.Skia
 				return null;
 			}
 
-			// About a tenth of the shorter display side in a common cursor size. DRM_CAP_CURSOR_WIDTH is only the size
-			// the driver suggests (often 64): larger sizes are tried and the first one the cursor plane takes is kept.
-			var wanted = Math.Min(displayWidth, displayHeight) / 10;
+			// About a fifth of the shorter display side in a common cursor size: the disc behind the arc is meant to
+			// cover the app's own spinner at that spot. DRM_CAP_CURSOR_WIDTH is only the size the driver suggests
+			// (often 64): larger sizes are tried and the first one the cursor plane takes is kept.
+			var wanted = Math.Min(displayWidth, displayHeight) / 5;
 			foreach (var size in new[] { 256, 128, 64 })
 			{
 				if (size != 64 && size > wanted * 3 / 2)
@@ -99,18 +100,33 @@ namespace Uno.UI.Runtime.Skia
 			using var bitmap = new SKBitmap(info);
 			using var canvas = new SKCanvas(bitmap);
 			var color = SKColor.TryParse(Environment.GetEnvironmentVariable(ColorEnvironmentVariable), out var parsed) ? parsed : DefaultColor;
-			float stroke = _size * 0.09f, inset = stroke;
-			// Arc on a faint gray track: no background disc, readable on light and dark pages
-			using var track = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Stroke, StrokeWidth = stroke, Color = new SKColor(0x80, 0x80, 0x80, 0x50) };
+			// Dark disc (opaque enough to hide an app spinner behind it) with a hairline border, the arc on a faint track
+			// inside: reads on light and dark pages
+			float stroke = _size * 0.065f, inset = _size * 0.2f;
+			var edge = _size * 0.02f;
+			using var disc = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Fill, Color = new SKColor(0x1c, 0x1c, 0x1e, 0xf5) };
+			using var border = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Stroke, StrokeWidth = Math.Max(1, _size / 100f), Color = new SKColor(0xff, 0xff, 0xff, 0x28) };
+			using var track = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Stroke, StrokeWidth = stroke, Color = new SKColor(0xff, 0xff, 0xff, 0x24) };
 			using var arc = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Stroke, StrokeWidth = stroke, StrokeCap = SKStrokeCap.Round, Color = color.WithAlpha(0xff) };
 			var ring = new SKRect(inset, inset, _size - inset, _size - inset);
+			var outer = new SKRect(edge, edge, _size - edge, _size - edge);
 
 			for (var i = 0; i < Steps; i++)
 			{
 				canvas.Clear(SKColors.Transparent);
+				canvas.DrawOval(outer, disc);
+				canvas.DrawOval(outer, border);
 				canvas.DrawOval(ring, track);
 				canvas.DrawArc(ring, i * 360f / Steps - 90, 100, false, arc);
 				canvas.Flush();
+				if (i == 0 && Environment.GetEnvironmentVariable("UNO_FRAMEBUFFER_BUSY_PREVIEW") is { Length: > 0 } preview)
+				{
+					// Design check: the first step as a PNG
+					using var image = SKImage.FromBitmap(bitmap);
+					using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+					using var file = System.IO.File.Create(preview);
+					data.SaveTo(file);
+				}
 
 				var bo = Native.gbm_bo_create(gbmDevice, (uint)_size, (uint)_size, Native.GBM_FORMAT_ARGB8888, Native.GBM_BO_USE_CURSOR | Native.GBM_BO_USE_WRITE);
 				if (bo == IntPtr.Zero)
