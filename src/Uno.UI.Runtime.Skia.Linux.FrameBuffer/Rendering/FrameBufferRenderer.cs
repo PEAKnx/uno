@@ -81,6 +81,11 @@ internal abstract class FrameBufferRenderer
 
 		if (_host.RootElement?.Visual.CompositionTarget is not CompositionTarget ct)
 		{
+			if (OverlayActive)
+			{
+				// The busy indicator can be asked for before the first frame (app start): nothing to draw it on yet
+				return false;
+			}
 			throw new Exception($"CompositionTarget is not set on the {nameof(IXamlRootHost)} at the point of rendering.");
 		}
 

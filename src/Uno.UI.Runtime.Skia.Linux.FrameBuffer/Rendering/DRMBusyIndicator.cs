@@ -11,7 +11,7 @@ namespace Uno.UI.Runtime.Skia
 	/// <summary>
 	/// Busy indicator for a blocked UI thread on the DRM host. Layout, bindings and frame recording all run on the UI
 	/// thread, so while it is busy (e.g. creating a page) no frame is recorded and app animations stand still. The
-	/// render thread does not depend on it: it draws the last recorded frame again with a spinner on a dark disc on top
+	/// render thread does not depend on it: it draws the last recorded frame again with a spinner on top
 	/// (just the size of the spinner). An app that shows its own loading state can force it (<see cref="FrameBufferBusyIndicator"/>)
 	/// and hide its spinner, so the two never alternate.
 	/// Opt-in: UNO_FRAMEBUFFER_BUSY_INDICATOR=&lt;ms&gt; shows it when the UI thread did not answer for that long;
@@ -24,10 +24,13 @@ namespace Uno.UI.Runtime.Skia
 		private static readonly SKColor DefaultColor = new(0x00, 0x78, 0xd4);
 		private const int FrameMs = 33;
 		private const int ProbeMs = 50;
+		// Stays on this long after the UI thread answered again (or the app stopped forcing it): a UI thread that is free
+		// for a moment and blocked again right after would make it vanish and come back
+		private const int LingerMs = 400;
 		// One revolution of the arc
 		private const int RevolutionMs = 1100;
-		// Ring and stroke relative to the shorter display side; the filled disc ends at the outer edge of the ring. Drawn a
-		// little above the center like the app's spinner above its text
+		// Ring and stroke relative to the shorter display side. Drawn a little above the center like the app's spinner
+		// above its text
 		private const float RingRadius = 0.12f;
 		private const float StrokeWidth = 0.025f;
 		private const float CenterUp = 0.06f;
@@ -36,8 +39,7 @@ namespace Uno.UI.Runtime.Skia
 		private readonly Action _requestRender;
 		private readonly Func<bool> _displayOn;
 		private readonly Thread _thread;
-		private readonly SKPaint _disc = new() { IsAntialias = true, Style = SKPaintStyle.Fill, Color = new SKColor(0x1c, 0x1c, 0x1e, 0xf5) };
-		private readonly SKPaint _track = new() { IsAntialias = true, Style = SKPaintStyle.Stroke, Color = new SKColor(0xff, 0xff, 0xff, 0x24) };
+		private readonly SKPaint _track = new() { IsAntialias = true, Style = SKPaintStyle.Stroke, Color = new SKColor(0x66, 0x66, 0x6a) };
 		private readonly SKPaint _arc;
 		private static volatile DRMBusyIndicator? s_current;
 		private static volatile bool s_forced;
@@ -45,6 +47,8 @@ namespace Uno.UI.Runtime.Skia
 		private volatile bool _showing;
 		// Stopwatch ticks of the pending probe (0: none pending); written by the probe thread, cleared on the UI thread
 		private long _probeSent;
+		// Stopwatch ticks of the last moment it was busy or forced
+		private long _lastBusy;
 
 		private DRMBusyIndicator(int delayMs, SKColor color, Action requestRender, Func<bool> displayOn)
 		{
@@ -101,13 +105,11 @@ namespace Uno.UI.Runtime.Skia
 			var cy = uiHeight / 2f - shorter * CenterUp;
 			var stroke = shorter * StrokeWidth;
 			var ring = shorter * RingRadius;
-			var radius = ring + stroke / 2;
 			var phase = Stopwatch.GetTimestamp() * 1000 / Stopwatch.Frequency % RevolutionMs * 360f / RevolutionMs;
 
 			canvas.Save();
 			canvas.Translate(transX, transY);
 			canvas.RotateDegrees(degrees);
-			canvas.DrawCircle(cx, cy, radius, _disc);
 			_track.StrokeWidth = stroke;
 			canvas.DrawCircle(cx, cy, ring, _track);
 			_arc.StrokeWidth = stroke;
@@ -128,6 +130,14 @@ namespace Uno.UI.Runtime.Skia
 				}
 
 				var busy = (s_forced || (sent != 0 && now - sent >= _delayTicks)) && _displayOn();
+				if (busy)
+				{
+					_lastBusy = now;
+				}
+				else if (_showing && _displayOn() && now - _lastBusy < LingerMs * Stopwatch.Frequency / 1000)
+				{
+					busy = true;
+				}
 				if (busy)
 				{
 					_showing = true;
@@ -160,7 +170,6 @@ namespace Uno.UI.Runtime.Skia
 				_thread.Join(500);
 			}
 			_showing = false;
-			_disc.Dispose();
 			_track.Dispose();
 			_arc.Dispose();
 		}
@@ -170,7 +179,7 @@ namespace Uno.UI.Runtime.Skia
 namespace Uno.UI.Runtime.Skia
 {
 	/// <summary>
-	/// The busy indicator of the DRM host (spinner on a disc, drawn by the render thread) for apps that want it as their
+	/// The busy indicator of the DRM host (spinner drawn by the render thread) for apps that want it as their
 	/// loading indication: while forced it is shown even though the UI thread is responsive, so the app can hide its own
 	/// spinner and the two never alternate. Needs UNO_FRAMEBUFFER_BUSY_INDICATOR (it sets the delay for a blocked UI thread).
 	/// </summary>
