@@ -1,4 +1,4 @@
-// Added by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
+﻿// Added by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
 using System;
 using System.Diagnostics;
 using System.Threading;
@@ -38,6 +38,8 @@ namespace Uno.UI.Runtime.Skia
 		private readonly SKPaint _border = new() { IsAntialias = true, Style = SKPaintStyle.Stroke, Color = new SKColor(0xff, 0xff, 0xff, 0x28) };
 		private readonly SKPaint _track = new() { IsAntialias = true, Style = SKPaintStyle.Stroke, Color = new SKColor(0xff, 0xff, 0xff, 0x24) };
 		private readonly SKPaint _arc;
+		private static volatile DRMBusyIndicator? s_current;
+		private static volatile bool s_forced;
 		private volatile bool _disposed;
 		private volatile bool _showing;
 		// Stopwatch ticks of the pending probe (0: none pending); written by the probe thread, cleared on the UI thread
@@ -52,6 +54,16 @@ namespace Uno.UI.Runtime.Skia
 			_thread = new Thread(Run) { IsBackground = true, Name = "DRM busy indicator" };
 		}
 
+		/// <summary>The running indicator, null if it is not enabled or the host does not use the DRM renderer.</summary>
+		internal static DRMBusyIndicator? Current => s_current;
+
+		/// <summary>The app shows its own loading state: the indicator is shown whatever the UI thread does.</summary>
+		internal static void SetForced(bool forced)
+		{
+			s_forced = forced;
+			s_current?._requestRender();
+		}
+
 		/// <summary>True while the indicator is drawn on top of the frames (the renderer presents every frame then).</summary>
 		public bool IsShowing => _showing;
 
@@ -64,6 +76,7 @@ namespace Uno.UI.Runtime.Skia
 			}
 			var color = SKColor.TryParse(Environment.GetEnvironmentVariable(ColorEnvironmentVariable), out var parsed) ? parsed : DefaultColor;
 			var indicator = new DRMBusyIndicator(delayMs, color, requestRender, displayOn);
+			s_current = indicator;
 			indicator._thread.Start();
 			indicator.LogInfo()?.Info($"Busy indicator after {delayMs} ms of a blocked UI thread (drawn by the render thread).");
 			return indicator;
@@ -115,7 +128,7 @@ namespace Uno.UI.Runtime.Skia
 					NativeDispatcher.Main.Enqueue(() => Interlocked.Exchange(ref _probeSent, 0), NativeDispatcherPriority.High);
 				}
 
-				var busy = sent != 0 && now - sent >= _delayTicks && _displayOn();
+				var busy = (s_forced || (sent != 0 && now - sent >= _delayTicks)) && _displayOn();
 				if (busy)
 				{
 					_showing = true;
@@ -139,6 +152,10 @@ namespace Uno.UI.Runtime.Skia
 		public void Dispose()
 		{
 			_disposed = true;
+			if (ReferenceEquals(s_current, this))
+			{
+				s_current = null;
+			}
 			if (_thread.IsAlive)
 			{
 				_thread.Join(500);
@@ -149,5 +166,22 @@ namespace Uno.UI.Runtime.Skia
 			_track.Dispose();
 			_arc.Dispose();
 		}
+	}
+}
+
+namespace Uno.UI.Runtime.Skia
+{
+	/// <summary>
+	/// The busy indicator of the DRM host (spinner on a disc, drawn by the render thread) for apps that want it as their
+	/// loading indication: while forced it is shown even though the UI thread is responsive, so the app can hide its own
+	/// spinner and the two never alternate. Needs UNO_FRAMEBUFFER_BUSY_INDICATOR (it sets the delay for a blocked UI thread).
+	/// </summary>
+	public static class FrameBufferBusyIndicator
+	{
+		/// <summary>True if the indicator is enabled and drawn by the DRM renderer.</summary>
+		public static bool IsAvailable => DRMBusyIndicator.Current is not null;
+
+		/// <summary>Shows the indicator until it is switched off again (any thread); no effect when it is not available.</summary>
+		public static void SetForced(bool forced) => DRMBusyIndicator.SetForced(forced);
 	}
 }
