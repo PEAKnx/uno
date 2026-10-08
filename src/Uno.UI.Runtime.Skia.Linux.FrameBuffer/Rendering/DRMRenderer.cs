@@ -231,8 +231,7 @@ namespace Uno.UI.Runtime.Skia
 				_connectorId = connectorId;
 				_dpmsPropertyId = FindConnectorProperty(connectorId, "DPMS");
 				DRMDisplayPower.Renderer = this;
-				// Needs cursor buffers of the display card: not available while another device renders
-				_busyIndicator = _renderFd != -1 ? null : DRMBusyIndicator.TryStart(_card, _crtc, device, modeInfo.Resolution.Width, modeInfo.Resolution.Height, () =>
+				_busyIndicator = DRMBusyIndicator.TryStart(InvalidateRender, () =>
 				{
 					lock (_powerLock)
 					{
@@ -748,11 +747,14 @@ namespace Uno.UI.Runtime.Skia
 		// Frames that change most of the screen skip the retained copy
 		protected override SKSurface? DirectSurface => PartialRedraw ? _glFbSurface : null;
 
+		protected override bool OverlayActive => _busyIndicator?.IsShowing == true;
+
 		protected override void PresentDirect(int degrees, int transX, int transY)
 		{
 			if (_glFbSurface is { } glFb)
 			{
 				DrawCursor(glFb.Canvas, degrees, transX, transY);
+				_busyIndicator?.Draw(glFb.Canvas, glFb.Canvas.DeviceClipBounds.Width, glFb.Canvas.DeviceClipBounds.Height, degrees, transX, transY);
 				glFb.Canvas.Flush();
 			}
 		}
@@ -766,6 +768,7 @@ namespace Uno.UI.Runtime.Skia
 					composition.Draw(glFb.Canvas, 0, 0, s_copyPaint);
 				}
 				DrawCursor(glFb.Canvas, degrees, transX, transY);
+				_busyIndicator?.Draw(glFb.Canvas, glFb.Canvas.DeviceClipBounds.Width, glFb.Canvas.DeviceClipBounds.Height, degrees, transX, transY);
 				glFb.Canvas.Flush();
 			}
 		}

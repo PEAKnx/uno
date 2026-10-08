@@ -1,7 +1,6 @@
-﻿// Added by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
+// Added by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
 using System;
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using System.Threading;
 using SkiaSharp;
 using Uno.Foundation.Logging;
@@ -11,9 +10,9 @@ namespace Uno.UI.Runtime.Skia
 {
 	/// <summary>
 	/// Busy indicator for a blocked UI thread on the DRM host. Layout, bindings and frame recording all run on the UI
-	/// thread, so while it is busy (e.g. creating a page) no frame is produced and app animations stand still. This
-	/// indicator lives on the display's cursor plane: the display engine blends it over the last frame, so it spins
-	/// without the UI thread and without touching the frame buffers.
+	/// thread, so while it is busy (e.g. creating a page) no frame is recorded and app animations stand still. The
+	/// render thread does not depend on it: it draws the last recorded frame again with a spinner on a dark disc on top,
+	/// which also hides a spinner of the app itself at the center of the screen (it would stand still or stutter).
 	/// Opt-in: UNO_FRAMEBUFFER_BUSY_INDICATOR=&lt;ms&gt; shows it when the UI thread did not answer for that long;
 	/// UNO_FRAMEBUFFER_BUSY_INDICATOR_COLOR=#RRGGBB sets the arc color (a saturated color reads on light and dark pages).
 	/// </summary>
@@ -22,131 +21,90 @@ namespace Uno.UI.Runtime.Skia
 		private const string EnvironmentVariable = "UNO_FRAMEBUFFER_BUSY_INDICATOR";
 		private const string ColorEnvironmentVariable = "UNO_FRAMEBUFFER_BUSY_INDICATOR_COLOR";
 		private static readonly SKColor DefaultColor = new(0x00, 0x78, 0xd4);
-		private const int Steps = 30;
 		private const int FrameMs = 33;
 		private const int ProbeMs = 50;
+		// One revolution of the arc
+		private const int RevolutionMs = 1100;
+		// Disc and ring relative to the shorter display side: the disc covers a 200 dp ring of the app (0.17 on a 1200 px
+		// display at scale 2), drawn a little above the center like the app's spinner above its text
+		private const float DiscRadius = 0.19f;
+		private const float CenterUp = 0.06f;
 
-		private readonly int _card;
-		private readonly uint _crtc;
-		private readonly int _size;
-		private readonly IntPtr[] _bos = new IntPtr[Steps];
-		private readonly uint[] _handles = new uint[Steps];
 		private readonly long _delayTicks;
+		private readonly Action _requestRender;
 		private readonly Func<bool> _displayOn;
 		private readonly Thread _thread;
+		private readonly SKPaint _disc = new() { IsAntialias = true, Style = SKPaintStyle.Fill, Color = new SKColor(0x1c, 0x1c, 0x1e, 0xf5) };
+		private readonly SKPaint _border = new() { IsAntialias = true, Style = SKPaintStyle.Stroke, Color = new SKColor(0xff, 0xff, 0xff, 0x28) };
+		private readonly SKPaint _track = new() { IsAntialias = true, Style = SKPaintStyle.Stroke, Color = new SKColor(0xff, 0xff, 0xff, 0x24) };
+		private readonly SKPaint _arc;
 		private volatile bool _disposed;
+		private volatile bool _showing;
 		// Stopwatch ticks of the pending probe (0: none pending); written by the probe thread, cleared on the UI thread
 		private long _probeSent;
-		private int _x, _y;
 
-		private DRMBusyIndicator(int card, uint crtc, int size, int delayMs, Func<bool> displayOn)
+		private DRMBusyIndicator(int delayMs, SKColor color, Action requestRender, Func<bool> displayOn)
 		{
-			_card = card;
-			_crtc = crtc;
-			_size = size;
 			_delayTicks = delayMs * Stopwatch.Frequency / 1000;
+			_requestRender = requestRender;
 			_displayOn = displayOn;
+			_arc = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Stroke, StrokeCap = SKStrokeCap.Round, Color = color.WithAlpha(0xff) };
 			_thread = new Thread(Run) { IsBackground = true, Name = "DRM busy indicator" };
 		}
 
-		/// <summary>Starts the indicator if enabled and the driver has a cursor plane; null otherwise.</summary>
-		public static DRMBusyIndicator? TryStart(int card, uint crtc, IntPtr gbmDevice, int displayWidth, int displayHeight, Func<bool> displayOn)
+		/// <summary>True while the indicator is drawn on top of the frames (the renderer presents every frame then).</summary>
+		public bool IsShowing => _showing;
+
+		/// <summary>Starts the indicator if enabled; null otherwise. <paramref name="requestRender"/> asks the render thread for a frame.</summary>
+		public static DRMBusyIndicator? TryStart(Action requestRender, Func<bool> displayOn)
 		{
 			if (!int.TryParse(Environment.GetEnvironmentVariable(EnvironmentVariable), out var delayMs) || delayMs <= 0)
 			{
 				return null;
 			}
-
-			// About a fifth of the shorter display side in a common cursor size: the disc behind the arc is meant to
-			// cover the app's own spinner at that spot. DRM_CAP_CURSOR_WIDTH is only the size the driver suggests
-			// (often 64): larger sizes are tried and the first one the cursor plane takes is kept.
-			var wanted = Math.Min(displayWidth, displayHeight) / 5;
-			foreach (var size in new[] { 256, 128, 64 })
-			{
-				if (size != 64 && size > wanted * 3 / 2)
-				{
-					continue;
-				}
-				var indicator = new DRMBusyIndicator(card, crtc, size, delayMs, displayOn);
-				try
-				{
-					indicator.CreateFrames(gbmDevice);
-					// The cursor plane rejects sizes it cannot scan out; shown off screen, so nothing flashes
-					Native.drmModeMoveCursor(card, crtc, -size, -size);
-					if (Native.drmModeSetCursor(card, crtc, indicator._handles[0], (uint)size, (uint)size) != 0)
-					{
-						throw new InvalidOperationException($"the cursor plane does not take {size} px");
-					}
-					Native.drmModeSetCursor(card, crtc, 0, 0, 0);
-				}
-				catch (Exception e)
-				{
-					indicator.LogInfo()?.Info($"Busy indicator: {e.Message}");
-					indicator.Dispose();
-					continue;
-				}
-				indicator._x = (displayWidth - size) / 2;
-				indicator._y = (displayHeight - size) / 2;
-				indicator._thread.Start();
-				indicator.LogInfo()?.Info($"Busy indicator after {delayMs} ms of a blocked UI thread ({size} px cursor plane).");
-				return indicator;
-			}
-			return null;
+			var color = SKColor.TryParse(Environment.GetEnvironmentVariable(ColorEnvironmentVariable), out var parsed) ? parsed : DefaultColor;
+			var indicator = new DRMBusyIndicator(delayMs, color, requestRender, displayOn);
+			indicator._thread.Start();
+			indicator.LogInfo()?.Info($"Busy indicator after {delayMs} ms of a blocked UI thread (drawn by the render thread).");
+			return indicator;
 		}
 
-		private unsafe void CreateFrames(IntPtr gbmDevice)
+		/// <summary>
+		/// Draws the indicator into a canvas of <paramref name="width"/> x <paramref name="height"/> pixels, rotated like the UI
+		/// (<paramref name="degrees"/>, translation as the renderer applies it).
+		/// </summary>
+		public void Draw(SKCanvas canvas, int width, int height, int degrees, int transX, int transY)
 		{
-			var info = new SKImageInfo(_size, _size, SKColorType.Bgra8888, SKAlphaType.Premul);
-			using var bitmap = new SKBitmap(info);
-			using var canvas = new SKCanvas(bitmap);
-			var color = SKColor.TryParse(Environment.GetEnvironmentVariable(ColorEnvironmentVariable), out var parsed) ? parsed : DefaultColor;
-			// Dark disc (opaque enough to hide an app spinner behind it) with a hairline border, the arc on a faint track
-			// inside: reads on light and dark pages
-			float stroke = _size * 0.065f, inset = _size * 0.2f;
-			var edge = _size * 0.02f;
-			using var disc = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Fill, Color = new SKColor(0x1c, 0x1c, 0x1e, 0xf5) };
-			using var border = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Stroke, StrokeWidth = Math.Max(1, _size / 100f), Color = new SKColor(0xff, 0xff, 0xff, 0x28) };
-			using var track = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Stroke, StrokeWidth = stroke, Color = new SKColor(0xff, 0xff, 0xff, 0x24) };
-			using var arc = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Stroke, StrokeWidth = stroke, StrokeCap = SKStrokeCap.Round, Color = color.WithAlpha(0xff) };
-			var ring = new SKRect(inset, inset, _size - inset, _size - inset);
-			var outer = new SKRect(edge, edge, _size - edge, _size - edge);
-
-			for (var i = 0; i < Steps; i++)
+			if (!_showing)
 			{
-				canvas.Clear(SKColors.Transparent);
-				canvas.DrawOval(outer, disc);
-				canvas.DrawOval(outer, border);
-				canvas.DrawOval(ring, track);
-				canvas.DrawArc(ring, i * 360f / Steps - 90, 100, false, arc);
-				canvas.Flush();
-				if (i == 0 && Environment.GetEnvironmentVariable("UNO_FRAMEBUFFER_BUSY_PREVIEW") is { Length: > 0 } preview)
-				{
-					// Design check: the first step as a PNG
-					using var image = SKImage.FromBitmap(bitmap);
-					using var data = image.Encode(SKEncodedImageFormat.Png, 100);
-					using var file = System.IO.File.Create(preview);
-					data.SaveTo(file);
-				}
-
-				var bo = Native.gbm_bo_create(gbmDevice, (uint)_size, (uint)_size, Native.GBM_FORMAT_ARGB8888, Native.GBM_BO_USE_CURSOR | Native.GBM_BO_USE_WRITE);
-				if (bo == IntPtr.Zero)
-				{
-					throw new InvalidOperationException("gbm_bo_create for a cursor buffer failed");
-				}
-				_bos[i] = bo;
-				// Cursor buffers are tightly packed (stride = width * 4), as is the bitmap
-				if (Native.gbm_bo_write(bo, bitmap.GetPixels(), (nuint)(_size * _size * 4)) != 0)
-				{
-					throw new InvalidOperationException("gbm_bo_write to a cursor buffer failed");
-				}
-				_handles[i] = (uint)Native.gbm_bo_get_handle(bo);
+				return;
 			}
+			// UI orientation: portrait rotations swap the sides
+			var uiWidth = degrees is 90 or -90 ? height : width;
+			var uiHeight = degrees is 90 or -90 ? width : height;
+			var shorter = Math.Min(uiWidth, uiHeight);
+			var radius = shorter * DiscRadius;
+			var cx = uiWidth / 2f;
+			var cy = uiHeight / 2f - shorter * CenterUp;
+			var stroke = radius * 0.13f;
+			var ring = radius * 0.62f;
+			var phase = Stopwatch.GetTimestamp() * 1000 / Stopwatch.Frequency % RevolutionMs * 360f / RevolutionMs;
+
+			canvas.Save();
+			canvas.Translate(transX, transY);
+			canvas.RotateDegrees(degrees);
+			canvas.DrawCircle(cx, cy, radius, _disc);
+			_border.StrokeWidth = Math.Max(1, radius / 50);
+			canvas.DrawCircle(cx, cy, radius - _border.StrokeWidth / 2, _border);
+			_track.StrokeWidth = stroke;
+			canvas.DrawCircle(cx, cy, ring, _track);
+			_arc.StrokeWidth = stroke;
+			canvas.DrawArc(new SKRect(cx - ring, cy - ring, cx + ring, cy + ring), phase - 90, 100, false, _arc);
+			canvas.Restore();
 		}
 
 		private void Run()
 		{
-			var shown = false;
-			var step = 0;
 			while (!_disposed)
 			{
 				var now = Stopwatch.GetTimestamp();
@@ -160,28 +118,21 @@ namespace Uno.UI.Runtime.Skia
 				var busy = sent != 0 && now - sent >= _delayTicks && _displayOn();
 				if (busy)
 				{
-					if (!shown)
-					{
-						Native.drmModeMoveCursor(_card, _crtc, _x, _y);
-						shown = true;
-					}
-					Native.drmModeSetCursor(_card, _crtc, _handles[step], (uint)_size, (uint)_size);
-					step = (step + 1) % Steps;
+					_showing = true;
+					// A frame per step: the render thread draws the last recorded frame again, the UI thread is not involved
+					_requestRender();
 					Thread.Sleep(FrameMs);
 				}
 				else
 				{
-					if (shown)
+					if (_showing)
 					{
-						Native.drmModeSetCursor(_card, _crtc, 0, 0, 0);
-						shown = false;
+						_showing = false;
+						// One more frame without the indicator
+						_requestRender();
 					}
 					Thread.Sleep(ProbeMs);
 				}
-			}
-			if (shown)
-			{
-				Native.drmModeSetCursor(_card, _crtc, 0, 0, 0);
 			}
 		}
 
@@ -192,44 +143,11 @@ namespace Uno.UI.Runtime.Skia
 			{
 				_thread.Join(500);
 			}
-			for (var i = 0; i < Steps; i++)
-			{
-				if (_bos[i] != IntPtr.Zero)
-				{
-					Native.gbm_bo_destroy(_bos[i]);
-					_bos[i] = IntPtr.Zero;
-				}
-			}
-		}
-
-		private static class Native
-		{
-			private const string libdrm = "libdrm.so.2";
-			private const string libgbm = "libgbm.so.1";
-
-			// fourcc 'AR24'
-			public const uint GBM_FORMAT_ARGB8888 = 0x34325241;
-			public const uint GBM_BO_USE_CURSOR = 1 << 1;
-			public const uint GBM_BO_USE_WRITE = 1 << 3;
-
-			[DllImport(libdrm)]
-			public static extern int drmModeSetCursor(int fd, uint crtcId, uint bo_handle, uint width, uint height);
-
-			[DllImport(libdrm)]
-			public static extern int drmModeMoveCursor(int fd, uint crtcId, int x, int y);
-
-			[DllImport(libgbm)]
-			public static extern IntPtr gbm_bo_create(IntPtr gbm, uint width, uint height, uint format, uint flags);
-
-			[DllImport(libgbm)]
-			public static extern int gbm_bo_write(IntPtr bo, IntPtr buf, nuint count);
-
-			// union gbm_bo_handle; the GEM handle is its u32
-			[DllImport(libgbm)]
-			public static extern ulong gbm_bo_get_handle(IntPtr bo);
-
-			[DllImport(libgbm)]
-			public static extern void gbm_bo_destroy(IntPtr bo);
+			_showing = false;
+			_disc.Dispose();
+			_border.Dispose();
+			_track.Dispose();
+			_arc.Dispose();
 		}
 	}
 }

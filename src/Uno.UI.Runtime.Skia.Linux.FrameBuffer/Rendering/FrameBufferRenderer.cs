@@ -1,4 +1,4 @@
-// Modified by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
+﻿// Modified by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
 using System;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -34,6 +34,8 @@ internal abstract class FrameBufferRenderer
 	private object? _redrawUntilNewerThan;
 	// The retained frame missed frames drawn straight into the output (DirectSurface): redraw it completely next
 	private bool _retainedStale;
+	// An overlay (busy indicator) was drawn on the last presented frame
+	private bool _overlayShown;
 
 	// Damaged share of the screen from which a frame is drawn straight into the output: redrawing nearly everything
 	// into the retained frame and copying it costs more than a full redraw (scrolling, fullscreen video)
@@ -83,6 +85,13 @@ internal abstract class FrameBufferRenderer
 		}
 
 		using var _ = MakeCurrent();
+		// With an overlay on screen (animated, or to be removed) every pass presents a frame, drawn again from the last recording
+		var overlay = OverlayActive;
+		if (overlay || _overlayShown)
+		{
+			_presentedFrame = null;
+		}
+		_overlayShown = overlay;
 		var bounds = FrameBufferWindowWrapper.Instance.Size;
 		var orientation = FrameBufferWindowWrapper.Instance.Orientation;
 		var (degrees, transX, transY) = orientation switch
@@ -292,6 +301,9 @@ internal abstract class FrameBufferRenderer
 	}
 
 	public abstract void InvalidateRender();
+
+	/// <summary>An overlay is drawn on top of the frames (see <see cref="DrawOverlay"/>): every render pass presents a frame.</summary>
+	protected virtual bool OverlayActive => false;
 
 	protected abstract IDisposable MakeCurrent();
 
