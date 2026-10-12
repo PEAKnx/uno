@@ -382,23 +382,43 @@ namespace Uno.UI.Runtime.Skia
 			}
 		}
 
+		// The thread that created the context keeps it current until its initialization ends, which is after this
+		// thread was started: eglMakeCurrent then fails (EGL_BAD_ACCESS) until that thread released it.
+		private void BindRenderThreadContext(int attempts)
+		{
+			for (var attempt = 0; attempt < attempts; attempt++)
+			{
+				if (EglHelper.EglMakeCurrent(_eglDisplay, _eglSurface, _eglSurface, _glContext))
+				{
+					return;
+				}
+				if (attempt + 1 < attempts)
+				{
+					Thread.Sleep(5);
+				}
+			}
+			if (this.Log().IsEnabled(LogLevel.Error))
+			{
+				this.Log().Error($"{nameof(EglHelper.EglMakeCurrent)} failed on the render thread.");
+			}
+		}
+
 		private void RenderLoop()
 		{
 			// Only this thread renders, so the context stays current here. Binding and releasing
 			// it around every frame (MakeCurrent) made the driver flush and revalidate its state each time.
-			if (!EglHelper.EglMakeCurrent(_eglDisplay, _eglSurface, _eglSurface, _glContext))
-			{
-				if (this.Log().IsEnabled(LogLevel.Error))
-				{
-					this.Log().Error($"{nameof(EglHelper.EglMakeCurrent)} failed on the render thread.");
-				}
-			}
+			BindRenderThreadContext(attempts: 400);
 			while (true)
 			{
 				_renderRequested.WaitOne();
 				if (_disposed)
 				{
 					return;
+				}
+				// Without a current context the app work below cannot use EGL (e.g. DMA-BUF imports)
+				if (EglHelper.EglGetCurrentContext() != _glContext)
+				{
+					BindRenderThreadContext(attempts: 1);
 				}
 				// App work on the render thread (FrameBufferGpu.TryInvoke), also while the display is off
 				FrameBufferGpu.RunPending(_grContext);
