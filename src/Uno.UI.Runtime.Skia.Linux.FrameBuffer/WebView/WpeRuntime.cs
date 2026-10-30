@@ -2,6 +2,9 @@
 #nullable enable
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Uno.Foundation.Logging;
@@ -22,6 +25,9 @@ internal static class WpeRuntime
 	private static volatile bool s_ready;
 	private static IntPtr s_context;
 	private static string? s_failure;
+
+	[DllImport("libc", SetLastError = true)]
+	private static extern int setenv(string name, string value, int overwrite);
 
 	/// <summary>True if libWPEWebKit, libWPEBackend-fdo and libwpe load. Checked once; never creates anything.</summary>
 	public static bool IsInstalled
@@ -91,6 +97,7 @@ internal static class WpeRuntime
 		{
 			try
 			{
+				PrepareEnvironment();
 				if (WpeNative.wpe_loader_init(WpeNative.Fdo) == 0)
 				{
 					Fail("wpe_loader_init failed");
@@ -124,6 +131,67 @@ internal static class WpeRuntime
 		})
 		{ IsBackground = true, Name = "WPE GLib" };
 		thread.Start();
+	}
+
+	/// <summary>
+	/// The host is DRM master on the primary node: the web process has to render on a render node. Sets
+	/// <c>WPE_DRM_RENDER_NODE</c> and <c>WPE_DRM_DEVICE</c> (inherited by the web process) unless they are set.
+	/// </summary>
+	private static void PrepareEnvironment()
+	{
+		var node = Environment.GetEnvironmentVariable("WPE_DRM_RENDER_NODE");
+		if (string.IsNullOrEmpty(node))
+		{
+			node = Directory.Exists("/dev/dri") ? Directory.GetFiles("/dev/dri", "renderD*").OrderBy(f => f, StringComparer.Ordinal).FirstOrDefault() : null;
+			if (node is null)
+			{
+				Log("no DRM render node: the web process may fail to render");
+				return;
+			}
+			setenv("WPE_DRM_RENDER_NODE", node, 0);
+		}
+		setenv("WPE_DRM_DEVICE", node, 0);
+		CheckSandbox();
+	}
+
+	/// <summary>
+	/// WebKit's sandbox (bubblewrap) needs user namespaces unless the process is root. Without them the web process
+	/// cannot start and WebKit aborts the whole app (GLib error). Checked once: if bubblewrap fails here, the sandbox
+	/// is switched off for this process and a warning is logged (security gap: the web process then runs unconfined).
+	/// </summary>
+	private static void CheckSandbox()
+	{
+		const string bwrap = "/usr/bin/bwrap";
+		if (!File.Exists(bwrap) || !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS")))
+		{
+			return;
+		}
+		var ok = false;
+		try
+		{
+			var psi = new ProcessStartInfo(bwrap) { RedirectStandardError = true, RedirectStandardOutput = true, UseShellExecute = false };
+			foreach (var arg in new[] { "--unshare-user-try", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--ro-bind", "/", "/", "true" })
+			{
+				psi.ArgumentList.Add(arg);
+			}
+			using var probe = Process.Start(psi);
+			if (probe is not null && probe.WaitForExit(5000))
+			{
+				ok = probe.ExitCode == 0;
+			}
+		}
+		catch (Exception e)
+		{
+			Log("sandbox check failed: " + e.Message);
+		}
+		if (!ok)
+		{
+			setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 1);
+			if (typeof(WpeRuntime).Log().IsEnabled(LogLevel.Warning))
+			{
+				typeof(WpeRuntime).Log().Warn("[wpe] bubblewrap cannot create namespaces for this user (kernel without user namespaces?): web content runs without sandbox");
+			}
+		}
 	}
 
 	/// <summary>Runs <paramref name="action"/> on the GLib thread. The runtime must be ready (any thread).</summary>

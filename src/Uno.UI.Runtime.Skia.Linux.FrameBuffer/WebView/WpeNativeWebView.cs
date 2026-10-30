@@ -33,7 +33,14 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 	private readonly CoreWebView2 _coreWebView;
 	private readonly ContentPresenter _presenter;
 	private readonly DispatcherQueue _dispatcher;
-	private readonly WpeView _view;
+	// an unloaded view gives its web process back after this time; shown again, it is created anew (history is lost)
+	private static readonly TimeSpan ReleaseDelay = TimeSpan.FromSeconds(10);
+
+	private readonly WpeCanvasElement _canvas;
+	private WpeView _view;
+	private bool _released;
+	private string? _lastUri; // never logged: may carry credentials
+	private DispatcherQueueTimer? _releaseTimer;
 	private bool _dontRaiseNextNavigationCompleted;
 	private bool _scrollingEnabled = true;
 	private string? _lastFocusValue;
@@ -45,47 +52,100 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 		_coreWebView = coreWebView2;
 		_presenter = presenter;
 		_dispatcher = presenter.DispatcherQueue;
-		// the scale is known here: WebKit does not pick up a later change of the device scale factor reliably
-		_view = new WpeView(800, 600, (float)(presenter.XamlRoot?.RasterizationScale ?? 1), null);
-		// weak: the view lives until it is disposed, the finalizer of this object disposes it
-		var weak = new WeakReference<WpeNativeWebView>(this);
-		_view.NavigationStarted += uri => { if (weak.TryGetTarget(out var t)) t.OnNavigationStarted(uri); };
-		_view.NavigationFinished += (uri, ok, back, fwd) => { if (weak.TryGetTarget(out var t)) t.OnNavigationFinished(uri, ok, back, fwd); };
-		_view.TitleChanged += () => { if (weak.TryGetTarget(out var t)) t._dispatcher.TryEnqueue(t._coreWebView.OnDocumentTitleChanged); };
-		_view.TextInputFocus += (f, p, h) => { if (weak.TryGetTarget(out var t)) t.OnTextInputFocus(f, p, h); };
-		_view.TextInputSurrounding += value => { if (weak.TryGetTarget(out var t)) t._lastFocusValue = value; };
-		presenter.Content = new WpeCanvasElement(_view);
+		_view = CreateView(null);
+		_canvas = new WpeCanvasElement(_view);
+		presenter.Content = _canvas;
 	}
 
 	~WpeNativeWebView() => _view.Dispose();
 
+	private WpeView CreateView(string? uri)
+	{
+		// the scale is known here: WebKit does not pick up a later change of the device scale factor reliably
+		var view = new WpeView(800, 600, (float)(_presenter.XamlRoot?.RasterizationScale ?? 1), uri);
+		// weak: the view lives until it is disposed, the finalizer of this object disposes it
+		var weak = new WeakReference<WpeNativeWebView>(this);
+		view.NavigationStarted += u => { if (weak.TryGetTarget(out var t)) t.OnNavigationStarted(u); };
+		view.NavigationFinished += (u, ok, back, fwd) => { if (weak.TryGetTarget(out var t)) t.OnNavigationFinished(u, ok, back, fwd); };
+		view.TitleChanged += () => { if (weak.TryGetTarget(out var t)) t._dispatcher.TryEnqueue(t._coreWebView.OnDocumentTitleChanged); };
+		view.TextInputFocus += (f, p, h) => { if (weak.TryGetTarget(out var t)) t.OnTextInputFocus(f, p, h); };
+		view.TextInputSurrounding += value => { if (weak.TryGetTarget(out var t)) t._lastFocusValue = value; };
+		return view;
+	}
+
+	/// <summary>The live view; a released one is created again with the last address (UI thread).</summary>
+	private WpeView View
+	{
+		get
+		{
+			if (_released)
+			{
+				_released = false;
+				_view = CreateView(_lastUri);
+				_canvas.SetView(_view);
+			}
+			return _view;
+		}
+	}
+
 	public string DocumentTitle => _view.Title;
 
-	public void OnLoaded() => _view.SetVisible(true);
+	public void OnLoaded()
+	{
+		_releaseTimer?.Stop();
+		View.SetVisible(true);
+	}
 
-	public void OnUnloaded() => _view.SetVisible(false);
+	public void OnUnloaded()
+	{
+		_view.SetVisible(false);
+		if (_released)
+		{
+			return;
+		}
+		if (_releaseTimer is null)
+		{
+			_releaseTimer = _dispatcher.CreateTimer();
+			_releaseTimer.IsRepeating = false;
+			_releaseTimer.Interval = ReleaseDelay;
+			_releaseTimer.Tick += (_, _) => Release();
+		}
+		_releaseTimer.Start();
+	}
 
-	public void GoBack() => _view.GoBack();
+	// RAM: each view has its own web process (about 110 MB); an unloaded one (page left, fullscreen closed) frees it
+	private void Release()
+	{
+		if (_released || _presenter.IsLoaded)
+		{
+			return;
+		}
+		_released = true;
+		_view.Dispose();
+		WpeRuntime.Log("unloaded view released");
+	}
 
-	public void GoForward() => _view.GoForward();
+	public void GoBack() => View.GoBack();
 
-	public void Stop() => _view.Stop();
+	public void GoForward() => View.GoForward();
 
-	public void Reload() => _view.Reload();
+	public void Stop() => View.Stop();
+
+	public void Reload() => View.Reload();
 
 	public void ProcessNavigation(Uri uri)
 	{
 		if (_coreWebView.HostToFolderMap.TryGetValue(uri.Host.ToLowerInvariant(), out var folderName))
 		{
-			_view.Load($"file://{Path.Join(Package.Current.InstalledPath, folderName, uri.PathAndQuery)}");
+			View.Load($"file://{Path.Join(Package.Current.InstalledPath, folderName, uri.PathAndQuery)}");
 		}
 		else
 		{
-			_view.Load(uri.ToString());
+			View.Load(uri.ToString());
 		}
 	}
 
-	public void ProcessNavigation(string html) => _view.LoadHtml(html);
+	public void ProcessNavigation(string html) => View.LoadHtml(html);
 
 	public void ProcessNavigation(HttpRequestMessage httpRequestMessage)
 	{
@@ -102,10 +162,10 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 		{
 			this.Log().Warn($"Only GET is supported, {httpRequestMessage.Method} was sent as GET.");
 		}
-		_view.LoadRequest(uri, httpRequestMessage);
+		View.LoadRequest(uri, httpRequestMessage);
 	}
 
-	public Task<string?> ExecuteScriptAsync(string script, CancellationToken token) => _view.ExecuteScriptAsync(script);
+	public Task<string?> ExecuteScriptAsync(string script, CancellationToken token) => View.ExecuteScriptAsync(script);
 
 	public Task<string?> InvokeScriptAsync(string script, string[]? arguments, CancellationToken token)
 	{
@@ -146,6 +206,10 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 
 	private void OnNavigationFinished(string uriString, bool success, bool canGoBack, bool canGoForward)
 	{
+		if (success && uriString.Length > 0)
+		{
+			_lastUri = uriString;
+		}
 		if (!success)
 		{
 			_dontRaiseNextNavigationCompleted = true;

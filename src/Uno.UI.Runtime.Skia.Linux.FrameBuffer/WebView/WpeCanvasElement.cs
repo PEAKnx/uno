@@ -16,20 +16,33 @@ namespace Uno.UI.Runtime.Skia.Wpe;
 /// </summary>
 internal sealed class WpeCanvasElement : SKCanvasElement
 {
-	private readonly WpeView _view;
+	private WpeView _view;
 	private double _scale = 1;
 
 	public WpeCanvasElement(WpeView view)
 	{
 		_view = view;
-		var weak = new WeakReference<WpeCanvasElement>(this);
-		_view.FrameReady += () => { if (weak.TryGetTarget(out var t)) t.DispatcherQueue?.TryEnqueue(t.Invalidate); };
+		Subscribe(view);
 		Loaded += (_, _) => _scale = XamlRoot?.RasterizationScale ?? 1;
 		PointerPressed += (s, e) => OnPointer(e, 0);
 		PointerMoved += (s, e) => OnPointer(e, 1);
 		PointerReleased += (s, e) => OnPointer(e, 2);
 		PointerCanceled += (s, e) => OnPointer(e, 2);
 		PointerWheelChanged += OnWheel;
+	}
+
+	/// <summary>Shows another view (a released view was created again).</summary>
+	public void SetView(WpeView view)
+	{
+		_view = view;
+		Subscribe(view);
+		Invalidate();
+	}
+
+	private void Subscribe(WpeView view)
+	{
+		var weak = new WeakReference<WpeCanvasElement>(this);
+		view.FrameReady += () => { if (weak.TryGetTarget(out var t)) t.DispatcherQueue?.TryEnqueue(t.Invalidate); };
 	}
 
 	protected override void RenderOverride(SKCanvas canvas, Size area)

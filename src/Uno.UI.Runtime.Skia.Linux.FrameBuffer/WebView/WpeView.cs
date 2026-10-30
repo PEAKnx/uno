@@ -24,6 +24,7 @@ internal sealed unsafe class WpeView
 	private delegate void GlEglImageTarget(uint target, IntPtr image);
 
 	private static readonly WpeNative.AsyncReady s_scriptDone = OnScriptDone;
+	private static readonly WpeNative.DestroyNotify s_backendDestroyed = OnBackendDestroyed;
 	private static long s_frames;
 
 	/// <summary>Frames exported by all views so far (diagnostics).</summary>
@@ -47,7 +48,11 @@ internal sealed unsafe class WpeView
 	private float _scale = 1;
 	private bool _visible = true;
 	private bool _failed;
-	private GCHandle _self; // native callbacks reach this object until it is disposed
+	private bool _started, _created;
+	private string? _initialUri;
+	private readonly List<Action> _beforeCreate = new(); // commands posted before the view exists, in order
+	private GCHandle _self; // native callbacks reach this object until WebKit has destroyed the view backend
+	private ulong[] _signals = Array.Empty<ulong>();
 
 	/// <summary>Render thread: a new frame was imported (the canvas redraws).</summary>
 	public event Action? FrameReady;
@@ -88,7 +93,18 @@ internal sealed unsafe class WpeView
 		_onLoadFailed = OnLoadFailed;
 		_onTitle = (_, _, _) => OnTitle();
 		_self = GCHandle.Alloc(this);
-		WpeRuntime.Run(() => Create(initialUri));
+		_initialUri = initialUri;
+	}
+
+	/// <summary>
+	/// Creates the WebKit view, once, with its real size: the first <see cref="SetSize"/> calls it. A view created with a
+	/// placeholder size and resized afterwards kept the placeholder layout size after a reload.
+	/// </summary>
+	private void Start()
+	{
+		_started = true;
+		var uri = _initialUri;
+		WpeRuntime.Run(() => Create(uri));
 	}
 
 	// ---- GLib thread -------------------------------------------------------------------------------------------------
@@ -110,7 +126,8 @@ internal sealed unsafe class WpeView
 			};
 			_exportable = WpeNative.wpe_view_backend_exportable_fdo_egl_create(_client, IntPtr.Zero, _width, _height);
 			_backend = WpeNative.wpe_view_backend_exportable_fdo_get_view_backend(_exportable);
-			var webBackend = WpeNative.webkit_web_view_backend_new(_backend, IntPtr.Zero, IntPtr.Zero);
+			// WebKit owns the backend: the exportable, the client struct and the callbacks are freed when it is done with it
+			var webBackend = WpeNative.webkit_web_view_backend_new(_backend, Marshal.GetFunctionPointerForDelegate(s_backendDestroyed), GCHandle.ToIntPtr(_self));
 			_view = WpeNative.webkit_web_view_new(webBackend);
 
 			try
@@ -132,9 +149,12 @@ internal sealed unsafe class WpeView
 				WpeNative.webkit_settings_set_user_agent_with_application_details(settings, name, FrameBufferWebView.ApplicationVersion);
 			}
 
-			WpeNative.g_signal_connect_data(_view, "load-changed", Marshal.GetFunctionPointerForDelegate(_onLoadChanged), IntPtr.Zero, IntPtr.Zero, 0);
-			WpeNative.g_signal_connect_data(_view, "load-failed", Marshal.GetFunctionPointerForDelegate(_onLoadFailed), IntPtr.Zero, IntPtr.Zero, 0);
-			WpeNative.g_signal_connect_data(_view, "notify::title", Marshal.GetFunctionPointerForDelegate(_onTitle), IntPtr.Zero, IntPtr.Zero, 0);
+			_signals = new[]
+			{
+				WpeNative.g_signal_connect_data(_view, "load-changed", Marshal.GetFunctionPointerForDelegate(_onLoadChanged), IntPtr.Zero, IntPtr.Zero, 0),
+				WpeNative.g_signal_connect_data(_view, "load-failed", Marshal.GetFunctionPointerForDelegate(_onLoadFailed), IntPtr.Zero, IntPtr.Zero, 0),
+				WpeNative.g_signal_connect_data(_view, "notify::title", Marshal.GetFunctionPointerForDelegate(_onTitle), IntPtr.Zero, IntPtr.Zero, 0),
+			};
 
 			WpeNative.wpe_view_backend_dispatch_set_device_scale_factor(_backend, _scale);
 			WpeNative.wpe_view_backend_add_activity_state(_backend, ActivityFocused | ActivityInWindow | (_visible ? ActivityVisible : 0));
@@ -149,16 +169,40 @@ internal sealed unsafe class WpeView
 			Failure = e.GetType().Name + ": " + e.Message;
 			WpeRuntime.Log("view creation failed: " + Failure);
 		}
+		List<Action> pending;
+		lock (_gate)
+		{
+			_created = true;
+			pending = new List<Action>(_beforeCreate);
+			_beforeCreate.Clear();
+		}
+		foreach (var action in pending)
+		{
+			RunIfAlive(action);
+		}
 	}
 
-	/// <summary>Runs on the GLib thread once the view exists; dropped if creation failed or the view is gone.</summary>
-	public void Post(Action action) => WpeRuntime.Run(() =>
+	private void RunIfAlive(Action action)
 	{
 		if (_view != IntPtr.Zero && !_disposed)
 		{
 			action();
 		}
-	});
+	}
+
+	/// <summary>Runs on the GLib thread once the view exists; dropped if creation failed or the view is gone.</summary>
+	public void Post(Action action)
+	{
+		lock (_gate)
+		{
+			if (!_created)
+			{
+				_beforeCreate.Add(action);
+				return;
+			}
+		}
+		WpeRuntime.Run(() => RunIfAlive(action));
+	}
 
 	public void Load(string uri) => Post(() => WpeNative.webkit_web_view_load_uri(_view, uri));
 
@@ -307,11 +351,21 @@ internal sealed unsafe class WpeView
 	{
 		width = Math.Max(1, width);
 		height = Math.Max(1, height);
+		if (!_started)
+		{
+			_width = width;
+			_height = height;
+			_scale = scale;
+			WpeRuntime.Log($"view size {width}x{height} (logical), scale {scale}");
+			Start();
+			return;
+		}
 		if (width == _width && height == _height && scale == _scale)
 		{
 			return;
 		}
 		var scaleChanged = scale != _scale;
+		WpeRuntime.Log($"view size {width}x{height} (logical), scale {scale}");
 		_width = width;
 		_height = height;
 		_scale = scale;
@@ -540,55 +594,91 @@ internal sealed unsafe class WpeView
 			return;
 		}
 		_disposed = true;
-		if (_failed || WpeRuntime.Failure is not null)
+		if (!_started || _failed || WpeRuntime.Failure is not null)
 		{
 			_self.Free();
 			return;
 		}
 		WpeRuntime.Run(() =>
 		{
-			if (_view != IntPtr.Zero)
+			if (_view == IntPtr.Zero)
 			{
-				WpeNative.g_object_unref(_view);
-				_view = IntPtr.Zero;
+				// creation failed before the backend went to WebKit
+				FreeNative();
+				return;
+			}
+			foreach (var id in _signals)
+			{
+				WpeNative.g_signal_handler_disconnect(_view, id);
 			}
 			_ime?.Release();
-			if (_exportable != IntPtr.Zero)
-			{
-				IntPtr pending, current;
-				lock (_gate)
-				{
-					pending = _pending;
-					_pending = IntPtr.Zero;
-					current = _current;
-					_current = IntPtr.Zero;
-				}
-				if (pending != IntPtr.Zero)
-				{
-					WpeNative.wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(_exportable, pending);
-				}
-				if (current != IntPtr.Zero)
-				{
-					WpeNative.wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(_exportable, current);
-				}
-				WpeNative.wpe_view_backend_exportable_fdo_destroy(_exportable);
-				_exportable = IntPtr.Zero;
-			}
-			if (_client != IntPtr.Zero)
-			{
-				Marshal.FreeHGlobal(_client);
-				_client = IntPtr.Zero;
-			}
-			_self.Free();
-			FrameBufferGpu.TryInvoke(_ =>
-			{
-				Interlocked.Exchange(ref _image, null)?.Dispose();
-				if (_texture != 0)
-				{
-					WpeNative.glDeleteTextures(1, ref _texture);
-					_texture = 0;
-				}
-			});
+			ReleaseFrames();
+			var view = _view;
+			_view = IntPtr.Zero;
+			// WebKit may keep the process of a closed view cached: end it, the view is gone for good
+			WpeNative.webkit_web_view_terminate_web_process(view);
+			// the rest happens in OnBackendDestroyed, once WebKit is done with the backend (it may still call it now)
+			WpeNative.g_object_unref(view);
 		});
+	}
+
+	private void ReleaseFrames()
+	{
+		IntPtr pending, current;
+		lock (_gate)
+		{
+			pending = _pending;
+			_pending = IntPtr.Zero;
+			current = _current;
+			_current = IntPtr.Zero;
+		}
+		if (_exportable == IntPtr.Zero)
+		{
+			return;
+		}
+		if (pending != IntPtr.Zero)
+		{
+			WpeNative.wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(_exportable, pending);
+		}
+		if (current != IntPtr.Zero)
+		{
+			WpeNative.wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(_exportable, current);
+		}
+	}
+
+	// GLib thread, called by WebKit when the view backend is destroyed (after the last reference to the view)
+	private static void OnBackendDestroyed(IntPtr data)
+	{
+		var view = (WpeView)GCHandle.FromIntPtr(data).Target!;
+		WpeRuntime.Log("view backend destroyed");
+		view.ReleaseFrames();
+		view.FreeNative();
+	}
+
+	private void FreeNative()
+	{
+		if (_exportable != IntPtr.Zero)
+		{
+			WpeNative.wpe_view_backend_exportable_fdo_destroy(_exportable);
+			_exportable = IntPtr.Zero;
+		}
+		if (_client != IntPtr.Zero)
+		{
+			Marshal.FreeHGlobal(_client);
+			_client = IntPtr.Zero;
+		}
+		FrameBufferGpu.TryInvoke(_ =>
+		{
+			Interlocked.Exchange(ref _image, null)?.Dispose();
+			if (_texture != 0)
+			{
+				WpeNative.glDeleteTextures(1, ref _texture);
+				_texture = 0;
+			}
+		});
+		if (_self.IsAllocated)
+		{
+			_self.Free();
+		}
 	}
 }

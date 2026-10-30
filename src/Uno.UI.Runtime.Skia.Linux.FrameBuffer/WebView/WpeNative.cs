@@ -26,6 +26,7 @@ internal static unsafe class WpeNative
 	[UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int LoadFailed(IntPtr view, int loadEvent, IntPtr failingUri, IntPtr error, IntPtr data);
 	[UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void NotifyProperty(IntPtr instance, IntPtr pspec, IntPtr data);
 	[UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void AsyncReady(IntPtr source, IntPtr result, IntPtr data);
+	[UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void DestroyNotify(IntPtr data);
 
 	[StructLayout(LayoutKind.Sequential)]
 	public struct EglClient
@@ -71,6 +72,7 @@ internal static unsafe class WpeNative
 	[DllImport(Web)] public static extern void webkit_web_view_load_request(IntPtr view, IntPtr request);
 	[DllImport(Web)] public static extern void webkit_web_view_reload(IntPtr view);
 	[DllImport(Web)] public static extern void webkit_web_view_stop_loading(IntPtr view);
+	[DllImport(Web)] public static extern void webkit_web_view_terminate_web_process(IntPtr view);
 	[DllImport(Web)] public static extern void webkit_web_view_go_back(IntPtr view);
 	[DllImport(Web)] public static extern void webkit_web_view_go_forward(IntPtr view);
 	[DllImport(Web)] public static extern int webkit_web_view_can_go_back(IntPtr view);
@@ -97,6 +99,7 @@ internal static unsafe class WpeNative
 	// GLib / GObject
 	[DllImport(GObject)] public static extern ulong g_signal_connect_data(IntPtr instance, [MarshalAs(UnmanagedType.LPStr)] string signal, IntPtr cb, IntPtr data, IntPtr destroy, int flags);
 	[DllImport(GObject)] public static extern void g_object_unref(IntPtr obj);
+	[DllImport(GObject)] public static extern void g_signal_handler_disconnect(IntPtr instance, ulong handlerId);
 	[DllImport(GLib)] public static extern IntPtr g_main_context_default();
 	[DllImport(GLib)] public static extern IntPtr g_main_loop_new(IntPtr ctx, int running);
 	[DllImport(GLib)] public static extern void g_main_loop_run(IntPtr loop);
