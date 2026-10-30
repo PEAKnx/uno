@@ -1,4 +1,5 @@
-﻿using System;
+﻿// Modified by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
+using System;
 using System.Threading;
 using Uno.Extensions.ApplicationModel.Core;
 using Uno.Foundation.Extensibility;
@@ -166,6 +167,7 @@ namespace Uno.UI.Runtime.Skia.Linux.FrameBuffer
 			ApiExtensibility.Register(typeof(Windows.UI.ViewManagement.IApplicationViewExtension), o => new ApplicationViewExtension(o));
 			ApiExtensibility.Register(typeof(Windows.Graphics.Display.IDisplayInformationExtension), o => new DisplayInformationExtension(o, DisplayScale));
 			ApiExtensibility.Register(typeof(Uno.ApplicationModel.DataTransfer.IClipboardExtension), o => new LocalClipboardExtension());
+			Uno.UI.Runtime.Skia.FrameBufferWebView.Register();
 
 			void Dispatch(System.Action d, NativeDispatcherPriority p)
 				=> _eventLoop.Schedule(d);
