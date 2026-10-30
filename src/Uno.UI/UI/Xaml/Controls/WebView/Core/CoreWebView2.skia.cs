@@ -1,4 +1,5 @@
-﻿#nullable enable
+﻿// Modified by PEAKnx GmbH (2026), see https://github.com/PEAKnx/uno/commits/pnx/6.7.135
+#nullable enable
 
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -15,6 +16,12 @@ public partial class CoreWebView2
 		if (VisualTreeHelper.GetChild((DependencyObject)_owner, 0) is not ContentPresenter { Name: "WebViewTemplateRoot" } contentPresenter)
 		{
 			return null;
+		}
+
+		// PEAKnx: a provider set by the host wins over the attribute-registered ones (the X11 add-in registers for every Linux host)
+		if (NativeWebViewProviderOverride.Create?.Invoke(this) is { } overrideProvider)
+		{
+			return overrideProvider.CreateNativeWebView(contentPresenter);
 		}
 
 		if (ApiExtensibility.CreateInstance<INativeWebViewProvider>(this, out var nativeWebViewProvider))
