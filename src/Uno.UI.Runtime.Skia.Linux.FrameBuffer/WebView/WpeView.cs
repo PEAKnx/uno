@@ -79,7 +79,21 @@ internal sealed unsafe class WpeView
 	public string Title { get; private set; } = string.Empty;
 
 	/// <summary>Why the view cannot show anything, or null.</summary>
-	public string? Failure { get; private set; }
+	public string? Failure
+	{
+		get => _failure;
+		private set
+		{
+			if (value is not null && _failure is null)
+			{
+				WpeRuntime.Log("view failed: " + value);
+			}
+			_failure = value;
+		}
+	}
+
+	private string? _failure;
+	private bool _firstFrameLogged;
 
 	public WpeView(uint width, uint height, float scale, string? initialUri)
 	{
@@ -400,7 +414,10 @@ internal sealed unsafe class WpeView
 
 	private void OnFrame(IntPtr image)
 	{
-		Interlocked.Increment(ref s_frames);
+		if (Interlocked.Increment(ref s_frames) == 1)
+		{
+			WpeRuntime.Log("first frame exported");
+		}
 		IntPtr drop;
 		lock (_gate)
 		{
@@ -451,6 +468,11 @@ internal sealed unsafe class WpeView
 			using (var backend = new GRBackendTexture(width, height, false, new GRGlTextureInfo(GlTexture2D, _texture, 0x8058))) // GL_RGBA8
 			{
 				fresh = SKImage.FromTexture(gr, backend, GRSurfaceOrigin.TopLeft, SKColorType.Rgba8888, SKAlphaType.Premul);
+			}
+			if (!_firstFrameLogged)
+			{
+				_firstFrameLogged = true;
+				WpeRuntime.Log($"first frame {width}x{height}" + (fresh is null ? ", texture import failed" : ""));
 			}
 			var previous = Interlocked.Exchange(ref _image, fresh);
 			var old = _current;

@@ -14,7 +14,8 @@ internal static unsafe class WpeNative
 	public const string Wpe = "libwpe-1.0.so.1";
 	public const string Fdo = "libWPEBackend-fdo-1.0.so.1";
 	public const string Web = "libWPEWebKit-2.0.so.1";
-	public const string Jsc = "libWPEJavaScriptCore-2.0.so.1";
+	// JavaScriptCore is part of libWPEWebKit (no separate library in the Buildroot build)
+	public const string Jsc = Web;
 	public const string GLib = "libglib-2.0.so.0";
 	public const string GObject = "libgobject-2.0.so.0";
 	public const string Egl = "libEGL.so.1";
@@ -109,6 +110,7 @@ internal static unsafe class WpeNative
 
 	// EGL / GLES
 	[DllImport(Egl)] public static extern IntPtr eglGetCurrentDisplay();
+	[DllImport(Egl)] public static extern IntPtr eglQueryString(IntPtr display, int name);
 	[DllImport(Egl)] public static extern IntPtr eglGetProcAddress([MarshalAs(UnmanagedType.LPStr)] string name);
 	[DllImport(Gles)] public static extern void glGenTextures(int n, out uint tex);
 	[DllImport(Gles)] public static extern void glDeleteTextures(int n, ref uint tex);

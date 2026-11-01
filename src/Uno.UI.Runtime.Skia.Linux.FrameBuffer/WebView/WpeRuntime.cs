@@ -93,6 +93,7 @@ internal static class WpeRuntime
 
 	private static void Start(IntPtr eglDisplay)
 	{
+		CheckEglWayland(eglDisplay);
 		var thread = new Thread(() =>
 		{
 			try
@@ -131,6 +132,21 @@ internal static class WpeRuntime
 		})
 		{ IsBackground = true, Name = "WPE GLib" };
 		thread.Start();
+	}
+
+	/// <summary>
+	/// wpebackend-fdo takes the frames of the web process as Wayland buffers: without EGL_WL_bind_wayland_display
+	/// (Mesa built without the Wayland platform) the web process never delivers a frame and web views stay blank.
+	/// </summary>
+	private static void CheckEglWayland(IntPtr eglDisplay)
+	{
+		const int EGL_EXTENSIONS = 0x3055;
+		var extensions = WpeNative.Utf8(WpeNative.eglQueryString(eglDisplay, EGL_EXTENSIONS)) ?? "";
+		if (!extensions.Split(' ').Contains("EGL_WL_bind_wayland_display") && typeof(WpeRuntime).Log().IsEnabled(LogLevel.Warning))
+		{
+			typeof(WpeRuntime).Log().Warn("[wpe] EGL lacks EGL_WL_bind_wayland_display (Mesa without the Wayland platform?): web views stay blank. "
+				+ "This extension is deprecated in Mesa: consider moving the WebView backend from libwpe/wpebackend-fdo to WPEPlatform (dma-buf, no Wayland).");
+		}
 	}
 
 	/// <summary>
