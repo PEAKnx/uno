@@ -87,6 +87,11 @@ internal static unsafe class WpeNative
 	[DllImport(Web)] public static extern IntPtr webkit_web_view_get_settings(IntPtr view);
 	[DllImport(Web)] public static extern void webkit_settings_set_user_agent_with_application_details(IntPtr settings, [MarshalAs(UnmanagedType.LPStr)] string? name, [MarshalAs(UnmanagedType.LPStr)] string? version);
 	[DllImport(Web)] public static extern void webkit_settings_set_enable_developer_extras(IntPtr settings, int enabled);
+	[DllImport(Web)] public static extern IntPtr webkit_network_session_get_default();
+	[DllImport(Web)] public static extern IntPtr webkit_network_session_get_cookie_manager(IntPtr session);
+	[DllImport(Web)] public static extern IntPtr webkit_network_session_get_website_data_manager(IntPtr session);
+	[DllImport(Web)] public static extern IntPtr webkit_website_data_manager_get_base_data_directory(IntPtr manager);
+	[DllImport(Web)] public static extern void webkit_cookie_manager_set_persistent_storage(IntPtr manager, [MarshalAs(UnmanagedType.LPUTF8Str)] string filename, int storage);
 
 	// libsoup3 (headers of a request)
 	[DllImport("libsoup-3.0.so.0")] public static extern void soup_message_headers_append(IntPtr headers, [MarshalAs(UnmanagedType.LPStr)] string name, [MarshalAs(UnmanagedType.LPStr)] string value);
@@ -101,6 +106,8 @@ internal static unsafe class WpeNative
 	[DllImport(GObject)] public static extern ulong g_signal_connect_data(IntPtr instance, [MarshalAs(UnmanagedType.LPStr)] string signal, IntPtr cb, IntPtr data, IntPtr destroy, int flags);
 	[DllImport(GObject)] public static extern void g_object_unref(IntPtr obj);
 	[DllImport(GObject)] public static extern void g_signal_handler_disconnect(IntPtr instance, ulong handlerId);
+	[DllImport(GLib)] public static extern IntPtr g_get_prgname();
+	[DllImport(GLib)] public static extern void g_set_prgname([MarshalAs(UnmanagedType.LPUTF8Str)] string name);
 	[DllImport(GLib)] public static extern IntPtr g_main_context_default();
 	[DllImport(GLib)] public static extern IntPtr g_main_loop_new(IntPtr ctx, int running);
 	[DllImport(GLib)] public static extern void g_main_loop_run(IntPtr loop);

@@ -46,7 +46,7 @@ public sealed class FrameBufferWebViewTextInputRequest
 	/// <summary>The page ended editing itself (the element lost focus or was removed): the keyboard should close.</summary>
 	public event Action? Ended;
 
-	/// <summary>Replaces the whole value of the element with <paramref name="text"/>.</summary>
+	/// <summary>Replaces the whole value of the element with <paramref name="text"/> and presses Return (Enter of the keyboard).</summary>
 	public void Accept(string text)
 	{
 		if (!_done)

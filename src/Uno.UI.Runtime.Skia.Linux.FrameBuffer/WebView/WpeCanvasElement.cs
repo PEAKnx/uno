@@ -18,16 +18,29 @@ internal sealed class WpeCanvasElement : SKCanvasElement
 {
 	private WpeView _view;
 	private double _scale = 1;
+	// contacts that began on this element
+	private readonly System.Collections.Generic.HashSet<uint> _pressed = new();
 
 	public WpeCanvasElement(WpeView view)
 	{
 		_view = view;
 		Subscribe(view);
+		// The page gets every gesture (as WebView2 on Windows): an ancestor ScrollViewer or FlipView would take over a
+		// touch drifting sideways, the contact ended for WebKit mid-gesture and scrolling stopped until the next touch
+		ManipulationMode = ManipulationModes.None;
 		Loaded += (_, _) => _scale = XamlRoot?.RasterizationScale ?? 1;
 		PointerPressed += (s, e) => OnPointer(e, 0);
 		PointerMoved += (s, e) => OnPointer(e, 1);
 		PointerReleased += (s, e) => OnPointer(e, 2);
 		PointerCanceled += (s, e) => OnPointer(e, 2);
+		// a lost capture ends the contact too: a contact WebKit never sees end blocks taps and scrolling
+		PointerCaptureLost += (s, e) =>
+		{
+			if (_pressed.Contains(e.Pointer.PointerId))
+			{
+				OnPointer(e, 2);
+			}
+		};
 		PointerWheelChanged += OnWheel;
 	}
 
@@ -60,17 +73,27 @@ internal sealed class WpeCanvasElement : SKCanvasElement
 	{
 		var point = e.GetCurrentPoint(this);
 		var touch = e.Pointer.PointerDeviceType == PointerDeviceType.Touch;
+		var id = e.Pointer.PointerId;
+		var firstContact = false;
 		if (phase == 0)
 		{
+			firstContact = _pressed.Count == 0;
+			_pressed.Add(id);
 			CapturePointer(e.Pointer);
 		}
 		else if (phase == 2)
 		{
+			if (!_pressed.Remove(id))
+			{
+				// release of a contact that began elsewhere (the tap that opened this view): WebKit never saw its start
+				e.Handled = true;
+				return;
+			}
 			ReleasePointerCapture(e.Pointer);
 		}
 		// input is in device pixels, the view size in DIPs
-		_view.Pointer(touch, (int)e.Pointer.PointerId, (int)(point.Position.X * _scale), (int)(point.Position.Y * _scale), phase,
-			point.Properties.IsLeftButtonPressed);
+		_view.Pointer(touch, (int)id, (int)(point.Position.X * _scale), (int)(point.Position.Y * _scale), phase,
+			point.Properties.IsLeftButtonPressed, firstContact);
 		e.Handled = true;
 	}
 

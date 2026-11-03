@@ -35,6 +35,8 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 	private readonly DispatcherQueue _dispatcher;
 	// an unloaded view gives its web process back after this time; shown again, it is created anew (history is lost)
 	private static readonly TimeSpan ReleaseDelay = TimeSpan.FromSeconds(10);
+	// a text focus this soon after a press or release on the view counts as the user's: the keyboard opens
+	private const long UserFocusWindowMs = 1500;
 
 	private readonly WpeCanvasElement _canvas;
 	private WpeView _view;
@@ -99,6 +101,14 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 	public void OnUnloaded()
 	{
 		_view.SetVisible(false);
+		if (_openRequest is not null)
+		{
+			// the keyboard of a view that is no longer shown would type into nothing
+			Interlocked.Increment(ref _focusSequence);
+			_openRequest.End();
+			_openRequest = null;
+			_view.Blur();
+		}
 		if (_released)
 		{
 			return;
@@ -253,6 +263,13 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 		}
 		if (!FrameBufferWebView.HasTextInputHandler)
 		{
+			return;
+		}
+		if (Environment.TickCount64 - _view.LastUserInput > UserFocusWindowMs)
+		{
+			// focus set by the page (autofocus on load), not by a tap: no keyboard. Blurred, so a tap on the field
+			// raises the focus again (WebKit reports focus only when editing starts)
+			_view.Blur();
 			return;
 		}
 		// WebKit reports the text of the element right after the focus: wait briefly for it as the keyboard's start value

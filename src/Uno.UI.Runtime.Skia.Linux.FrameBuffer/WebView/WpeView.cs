@@ -30,6 +30,7 @@ internal sealed unsafe class WpeView
 	/// <summary>Frames exported by all views so far (diagnostics).</summary>
 	public static long TotalFrames => Interlocked.Read(ref s_frames);
 
+
 	// delegates and the client struct stay alive as long as the view
 	private readonly WpeNative.ExportImage _onFdoImage, _onEglImage, _onShm;
 	private readonly WpeNative.LoadChanged _onLoadChanged;
@@ -37,6 +38,11 @@ internal sealed unsafe class WpeView
 	private readonly WpeNative.NotifyProperty _onTitle;
 	private readonly object _gate = new();
 	private readonly Dictionary<int, WpeNative.TouchRaw> _touches = new();
+	// touch moves are coalesced (GLib thread), see QueueMove
+	private const long TouchMoveIntervalMs = 33;
+	private readonly Dictionary<int, WpeNative.TouchRaw> _pendingMoves = new();
+	private long _lastMoveSent;
+	private bool _moveFlushQueued;
 	private IntPtr _client, _exportable, _backend, _view;
 	private WpeImeContext? _ime;
 	private IntPtr _pending, _current; // wpe_fdo_egl_exported_image*
@@ -94,6 +100,10 @@ internal sealed unsafe class WpeView
 
 	private string? _failure;
 	private bool _firstFrameLogged;
+	private bool _inputLogged;
+
+	/// <summary><see cref="Environment.TickCount64"/> of the last press or release on this view (0: none yet).</summary>
+	public long LastUserInput { get; private set; }
 
 	public WpeView(uint width, uint height, float scale, string? initialUri)
 	{
@@ -509,40 +519,42 @@ internal sealed unsafe class WpeView
 
 	// ---- input (any thread) ------------------------------------------------------------------------------------------
 
-	/// <summary>Pointer or touch. Coordinates in device pixels. <paramref name="phase"/>: 0 down, 1 move, 2 up.</summary>
-	public void Pointer(bool touch, int id, int x, int y, int phase, bool primaryPressed)
+	/// <summary>
+	/// Pointer or touch. Coordinates in device pixels. <paramref name="phase"/>: 0 down, 1 move, 2 up.
+	/// <paramref name="firstContact"/>: no other contact is down, touch points WebKit still holds are ended first.
+	/// </summary>
+	public void Pointer(bool touch, int id, int x, int y, int phase, bool primaryPressed, bool firstContact = false)
 	{
 		var time = (uint)Environment.TickCount;
+		if (phase != 1)
+		{
+			LastUserInput = Environment.TickCount64;
+		}
+		if (!_inputLogged)
+		{
+			_inputLogged = true;
+			WpeRuntime.Log($"first input {(touch ? "touch" : "pointer")} {x},{y} (view {_width}x{_height}, scale {_scale})");
+		}
 		if (touch)
 		{
 			Post(() =>
 			{
-				var type = phase == 0 ? 1 : phase == 1 ? 2 : 3; // down, motion, up
-				if (phase == 1 && !_touches.ContainsKey(id))
+				if (phase != 0 && !_touches.ContainsKey(id))
 				{
 					return;
 				}
-				_touches[id] = new WpeNative.TouchRaw { Type = type, Time = time, Id = id, X = x, Y = y };
-				var points = new WpeNative.TouchRaw[_touches.Count];
-				var i = 0;
-				foreach (var pair in _touches)
+				if (phase == 1)
 				{
-					var raw = pair.Value;
-					if (pair.Key != id)
-					{
-						raw.Type = 2;
-					}
-					points[i++] = raw;
+					QueueMove(new WpeNative.TouchRaw { Type = 2, Time = time, Id = id, X = x, Y = y });
+					return;
 				}
-				fixed (WpeNative.TouchRaw* p = points)
+				// moves still waiting go first: the order of the contacts stays
+				FlushMoves();
+				if (phase == 0 && firstContact && _touches.Count > 0)
 				{
-					var e = new WpeNative.TouchEvent { Points = p, Length = (ulong)points.Length, Type = type, Id = id, Time = time };
-					WpeNative.wpe_view_backend_dispatch_touch_event(_backend, ref e);
+					EndStaleTouches(time);
 				}
-				if (phase == 2)
-				{
-					_touches.Remove(id);
-				}
+				DispatchTouch(new WpeNative.TouchRaw { Type = phase == 0 ? 1 : 3, Time = time, Id = id, X = x, Y = y }); // down, up
 			});
 		}
 		else
@@ -556,6 +568,101 @@ internal sealed unsafe class WpeView
 				Modifiers = primaryPressed ? (1u << 20) : 0u,
 			};
 			Post(() => WpeNative.wpe_view_backend_dispatch_pointer_event(_backend, ref pe));
+		}
+	}
+
+	/// <summary>
+	/// GLib thread: a move is sent at most every <see cref="TouchMoveIntervalMs"/>, with the latest position. Pages with
+	/// touch listeners (Google) run script for every move and WebKit scrolls only after it: at the panel's touch rate
+	/// (about 100 moves per second) the web process' main thread is saturated and scrolling stalls for seconds.
+	/// </summary>
+	private void QueueMove(WpeNative.TouchRaw move)
+	{
+		_pendingMoves[move.Id] = move;
+		var wait = TouchMoveIntervalMs - (Environment.TickCount64 - _lastMoveSent);
+		if (wait <= 0)
+		{
+			FlushMoves();
+		}
+		else if (!_moveFlushQueued)
+		{
+			_moveFlushQueued = true;
+			Task.Delay((int)wait).ContinueWith(_ => Post(() =>
+			{
+				_moveFlushQueued = false;
+				FlushMoves();
+			}));
+		}
+	}
+
+	/// <summary>GLib thread: sends the moves waiting in <see cref="QueueMove"/>.</summary>
+	private void FlushMoves()
+	{
+		if (_pendingMoves.Count == 0)
+		{
+			return;
+		}
+		_lastMoveSent = Environment.TickCount64;
+		foreach (var move in _pendingMoves.Values)
+		{
+			if (_touches.ContainsKey(move.Id))
+			{
+				DispatchTouch(move);
+			}
+		}
+		_pendingMoves.Clear();
+	}
+
+	/// <summary>GLib thread: sends one touch change with all held points (the others as motion).</summary>
+	private void DispatchTouch(WpeNative.TouchRaw changed)
+	{
+		_touches[changed.Id] = changed;
+		var points = new WpeNative.TouchRaw[_touches.Count];
+		var i = 0;
+		foreach (var pair in _touches)
+		{
+			var raw = pair.Value;
+			if (pair.Key != changed.Id)
+			{
+				raw.Type = 2;
+			}
+			points[i++] = raw;
+		}
+		fixed (WpeNative.TouchRaw* p = points)
+		{
+			var e = new WpeNative.TouchEvent { Points = p, Length = (ulong)points.Length, Type = changed.Type, Id = changed.Id, Time = changed.Time };
+			WpeNative.wpe_view_backend_dispatch_touch_event(_backend, ref e);
+		}
+		if (changed.Type == 3)
+		{
+			_touches.Remove(changed.Id);
+		}
+	}
+
+	/// <summary>GLib thread: sends the end of touch points whose release never arrived (capture lost, view swapped).</summary>
+	private void EndStaleTouches(uint time)
+	{
+		WpeRuntime.Log($"ending {_touches.Count} stale touch point(s)");
+		foreach (var stale in new List<int>(_touches.Keys))
+		{
+			var raw = _touches[stale];
+			raw.Type = 3;
+			raw.Time = time;
+			_touches.Remove(stale);
+			var points = new WpeNative.TouchRaw[_touches.Count + 1];
+			var i = 0;
+			foreach (var other in _touches.Values)
+			{
+				var o = other;
+				o.Type = 2;
+				points[i++] = o;
+			}
+			points[i] = raw;
+			fixed (WpeNative.TouchRaw* p = points)
+			{
+				var e = new WpeNative.TouchEvent { Points = p, Length = (ulong)points.Length, Type = 3, Id = stale, Time = time };
+				WpeNative.wpe_view_backend_dispatch_touch_event(_backend, ref e);
+			}
 		}
 	}
 
@@ -578,7 +685,8 @@ internal sealed unsafe class WpeView
 
 	/// <summary>
 	/// Replaces the whole value of the focused editable element: select all (Ctrl+A), then commit the new text (or delete when
-	/// empty). The element is blurred after the commit was applied, so the next tap raises a focus event again.
+	/// empty), then press Return like a physical keyboard (forms submit). The element is blurred afterwards, so the next
+	/// tap raises a focus event again.
 	/// </summary>
 	public void ReplaceText(string text) => Post(() =>
 	{
@@ -598,8 +706,12 @@ internal sealed unsafe class WpeView
 		{
 			_ime?.Commit(text);
 		}
-		// the commit travels to the web process asynchronously
-		Task.Delay(400).ContinueWith(_ => Blur());
+		// the commit travels to the web process asynchronously (IME channel): Return and blur follow once it is applied
+		Task.Delay(150).ContinueWith(_ =>
+		{
+			Key(0xff0d);
+			Task.Delay(400).ContinueWith(_ => Blur());
+		});
 	});
 
 	/// <summary>Drops the edit focus so the next tap on a field raises a focus event (WebKit reports focus only when editing starts or ends).</summary>

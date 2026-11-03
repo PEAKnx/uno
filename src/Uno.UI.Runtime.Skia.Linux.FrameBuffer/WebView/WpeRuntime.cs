@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Uno.Foundation.Logging;
@@ -98,6 +99,7 @@ internal static class WpeRuntime
 		{
 			try
 			{
+				SetProgramName();
 				PrepareEnvironment();
 				if (WpeNative.wpe_loader_init(WpeNative.Fdo) == 0)
 				{
@@ -110,6 +112,15 @@ internal static class WpeRuntime
 					return;
 				}
 				s_context = WpeNative.g_main_context_default();
+				try
+				{
+					PersistCookies();
+				}
+				catch (Exception e)
+				{
+					// web views still work, with cookies in memory
+					Log("persistent cookies not available: " + e.Message);
+				}
 				List<Action> early;
 				lock (s_gate)
 				{
@@ -147,6 +158,38 @@ internal static class WpeRuntime
 			typeof(WpeRuntime).Log().Warn("[wpe] EGL lacks EGL_WL_bind_wayland_display (Mesa without the Wayland platform?): web views stay blank. "
 				+ "This extension is deprecated in Mesa: consider moving the WebView backend from libwpe/wpebackend-fdo to WPEPlatform (dma-buf, no Wayland).");
 		}
+	}
+
+	/// <summary>
+	/// The default session keeps its data in <c>$XDG_DATA_HOME/&lt;GLib program name&gt;</c>. Without a name the WPE
+	/// libraries set "&lt;unknown&gt;": the app's assembly name is set before the session exists.
+	/// </summary>
+	private static void SetProgramName()
+	{
+		var current = WpeNative.Utf8(WpeNative.g_get_prgname());
+		if ((current is null || current == "<unknown>") && Assembly.GetEntryAssembly()?.GetName().Name is { } name)
+		{
+			WpeNative.g_set_prgname(name);
+		}
+	}
+
+	/// <summary>
+	/// GLib thread, before the first view: cookies of the default session are kept in its data directory
+	/// (<c>cookies.sqlite</c>), so consents and logins of web pages survive a restart.
+	/// </summary>
+	private static void PersistCookies()
+	{
+		const int WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE = 1;
+		var session = WpeNative.webkit_network_session_get_default();
+		var dir = WpeNative.Utf8(WpeNative.webkit_website_data_manager_get_base_data_directory(WpeNative.webkit_network_session_get_website_data_manager(session)));
+		if (string.IsNullOrEmpty(dir))
+		{
+			Log("no website data directory: cookies are kept in memory only");
+			return;
+		}
+		Directory.CreateDirectory(dir);
+		WpeNative.webkit_cookie_manager_set_persistent_storage(WpeNative.webkit_network_session_get_cookie_manager(session), Path.Combine(dir, "cookies.sqlite"), WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+		Log("cookies persisted in the website data directory");
 	}
 
 	/// <summary>
