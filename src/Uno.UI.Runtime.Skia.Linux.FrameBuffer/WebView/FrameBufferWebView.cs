@@ -43,7 +43,10 @@ public sealed class FrameBufferWebViewTextInputRequest
 	/// <summary>Current text of the element, the keyboard's start value. Do not log it.</summary>
 	public string Value { get; }
 
-	/// <summary>The page ended editing itself (the element lost focus or was removed): the keyboard should close.</summary>
+	/// <summary>
+	/// The page ended editing itself (the element lost focus or was removed) or the view went away: the keyboard should
+	/// close. Raised on the UI thread.
+	/// </summary>
 	public event Action? Ended;
 
 	/// <summary>Replaces the whole value of the element with <paramref name="text"/> and presses Return (Enter of the keyboard).</summary>

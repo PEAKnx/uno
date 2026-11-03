@@ -30,6 +30,99 @@ internal static class WpeRuntime
 	private static int s_darkMode = -1;
 	// background where a page has not painted yet (ARGB), -1: WebKit's default (white)
 	private static long s_background = -1;
+	private static int s_liveViews;
+
+	// Every live view has its own web process: 150-170 MB RSS (ADR 0001 section 10). The views may use this share of
+	// the RAM; 4 GB devices get 4 views, 2 GB devices 2.
+	private const int ViewRamPercent = 20;
+	private const int ViewRamMb = 170;
+	private const int MaxLiveViewsCap = 8;
+
+	/// <summary>
+	/// Number of web views that may be live at once (a web process each), from the RAM of the device. The environment
+	/// variable <c>UNO_FRAMEBUFFER_WEBVIEW_MAX</c> overrides it.
+	/// </summary>
+	public static int MaxLiveViews { get; } = ComputeMaxLiveViews();
+
+	private static int ComputeMaxLiveViews()
+	{
+		if (int.TryParse(Environment.GetEnvironmentVariable("UNO_FRAMEBUFFER_WEBVIEW_MAX"), out var forced) && forced >= 1)
+		{
+			return forced;
+		}
+		long totalMb = 0;
+		try
+		{
+			// "MemTotal:  3912345 kB"
+			var line = File.ReadLines("/proc/meminfo").FirstOrDefault(l => l.StartsWith("MemTotal:", StringComparison.Ordinal));
+			if (line is not null && long.TryParse(line.Split(' ', StringSplitOptions.RemoveEmptyEntries)[1], out var kb))
+			{
+				totalMb = kb / 1024;
+			}
+		}
+		catch (Exception e)
+		{
+			Log("RAM of the device unknown: " + e.Message);
+		}
+		var limit = totalMb > 0 ? (int)Math.Clamp(totalMb * ViewRamPercent / 100 / ViewRamMb, 1, MaxLiveViewsCap) : 2;
+		Log($"web views: at most {limit} live at once (RAM {(totalMb > 0 ? totalMb + " MB" : "unknown")})");
+		return limit;
+	}
+
+	/// <summary>GLib thread: a view is about to be created. False (and why) when the limit is reached.</summary>
+	internal static bool TryAcquireView(out string reason)
+	{
+		var live = Interlocked.Increment(ref s_liveViews);
+		if (live > MaxLiveViews)
+		{
+			Interlocked.Decrement(ref s_liveViews);
+			reason = $"too many web views: {MaxLiveViews} live at the most for the RAM of this device";
+			return false;
+		}
+		reason = string.Empty;
+		return true;
+	}
+
+	/// <summary>A view acquired with <see cref="TryAcquireView"/> is gone.</summary>
+	internal static void ReleaseView() => Interlocked.Decrement(ref s_liveViews);
+
+	/// <summary>
+	/// Schemes a page may navigate to (links, redirects, forms). Local files stay out of reach of web content; the
+	/// app's own mapped folders are checked by the view.
+	/// </summary>
+	internal static bool IsAllowedScheme(string scheme) => scheme is "http" or "https" or "about" or "data" or "blob";
+
+	private static readonly List<string> s_allowedFolders = new();
+
+	/// <summary>A folder of the app (CoreWebView2 virtual host mapping) whose files pages may open.</summary>
+	internal static void AllowFolder(string folder)
+	{
+		var full = Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+		lock (s_allowedFolders)
+		{
+			if (!s_allowedFolders.Contains(full))
+			{
+				s_allowedFolders.Add(full);
+			}
+		}
+	}
+
+	internal static bool IsAllowedFile(string path)
+	{
+		string full;
+		try
+		{
+			full = Path.GetFullPath(path);
+		}
+		catch (ArgumentException)
+		{
+			return false;
+		}
+		lock (s_allowedFolders)
+		{
+			return s_allowedFolders.Any(folder => full.StartsWith(folder, StringComparison.Ordinal));
+		}
+	}
 
 	/// <summary>GLib thread: the background color changed, the views apply it (<see cref="ApplyBackground"/>).</summary>
 	internal static event Action? BackgroundChanged;

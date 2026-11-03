@@ -147,6 +147,8 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 	{
 		if (_coreWebView.HostToFolderMap.TryGetValue(uri.Host.ToLowerInvariant(), out var folderName))
 		{
+			// the only place pages may reach local files: the folders the app maps itself
+			WpeRuntime.AllowFolder(Path.Join(Package.Current.InstalledPath, folderName));
 			View.Load($"file://{Path.Join(Package.Current.InstalledPath, folderName, uri.PathAndQuery)}");
 		}
 		else

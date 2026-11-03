@@ -25,6 +25,7 @@ internal static unsafe class WpeNative
 	[UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GSourceFunc(IntPtr data);
 	[UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void LoadChanged(IntPtr view, int loadEvent, IntPtr data);
 	[UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int LoadFailed(IntPtr view, int loadEvent, IntPtr failingUri, IntPtr error, IntPtr data);
+	[UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int DecidePolicy(IntPtr view, IntPtr decision, int decisionType, IntPtr data);
 	[UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void NotifyProperty(IntPtr instance, IntPtr pspec, IntPtr data);
 	[UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void AsyncReady(IntPtr source, IntPtr result, IntPtr data);
 	[UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void DestroyNotify(IntPtr data);
@@ -89,6 +90,11 @@ internal static unsafe class WpeNative
 	[DllImport(Web)] public static extern void webkit_settings_set_enable_developer_extras(IntPtr settings, int enabled);
 	[StructLayout(LayoutKind.Sequential)] public struct WebKitColor { public double Red, Green, Blue, Alpha; }
 	[DllImport(Web)] public static extern void webkit_web_view_set_background_color(IntPtr view, ref WebKitColor color);
+	// navigation policy (decide-policy): which address a navigation goes to, and ignoring it
+	[DllImport(Web)] public static extern IntPtr webkit_navigation_policy_decision_get_navigation_action(IntPtr decision);
+	[DllImport(Web)] public static extern IntPtr webkit_navigation_action_get_request(IntPtr action);
+	[DllImport(Web)] public static extern IntPtr webkit_uri_request_get_uri(IntPtr request);
+	[DllImport(Web)] public static extern void webkit_policy_decision_ignore(IntPtr decision);
 	// PEAKnx WebKit patch (BSP board/common/patches/wpewebkit): dark mode of the libwpe views
 	[DllImport(Web)] public static extern void webkit_pnx_set_dark_mode(int dark);
 	[DllImport(Web)] public static extern IntPtr webkit_network_session_get_default();

@@ -35,6 +35,9 @@ internal sealed unsafe class WpeView
 	private readonly WpeNative.ExportImage _onFdoImage, _onEglImage, _onShm;
 	private readonly WpeNative.LoadChanged _onLoadChanged;
 	private readonly WpeNative.LoadFailed _onLoadFailed;
+	private readonly WpeNative.DecidePolicy _onDecidePolicy;
+	// counted against WpeRuntime.MaxLiveViews (GLib thread)
+	private bool _counted;
 	private readonly WpeNative.NotifyProperty _onTitle;
 	private readonly object _gate = new();
 	private readonly Dictionary<int, WpeNative.TouchRaw> _touches = new();
@@ -115,6 +118,7 @@ internal sealed unsafe class WpeView
 		_onShm = (_, buffer) => WpeNative.wpe_view_backend_exportable_fdo_egl_dispatch_release_shm_exported_buffer(_exportable, buffer);
 		_onLoadChanged = OnLoadChanged;
 		_onLoadFailed = OnLoadFailed;
+		_onDecidePolicy = OnDecidePolicy;
 		_onTitle = (_, _, _) => OnTitle();
 		_self = GCHandle.Alloc(this);
 		_initialUri = initialUri;
@@ -141,6 +145,11 @@ internal sealed unsafe class WpeView
 		}
 		try
 		{
+			if (!WpeRuntime.TryAcquireView(out var refusal))
+			{
+				throw new ViewLimitException(refusal);
+			}
+			_counted = true;
 			_client = Marshal.AllocHGlobal(sizeof(WpeNative.EglClient));
 			*(WpeNative.EglClient*)_client = new WpeNative.EglClient
 			{
@@ -180,6 +189,7 @@ internal sealed unsafe class WpeView
 			{
 				WpeNative.g_signal_connect_data(_view, "load-changed", Marshal.GetFunctionPointerForDelegate(_onLoadChanged), IntPtr.Zero, IntPtr.Zero, 0),
 				WpeNative.g_signal_connect_data(_view, "load-failed", Marshal.GetFunctionPointerForDelegate(_onLoadFailed), IntPtr.Zero, IntPtr.Zero, 0),
+				WpeNative.g_signal_connect_data(_view, "decide-policy", Marshal.GetFunctionPointerForDelegate(_onDecidePolicy), IntPtr.Zero, IntPtr.Zero, 0),
 				WpeNative.g_signal_connect_data(_view, "notify::title", Marshal.GetFunctionPointerForDelegate(_onTitle), IntPtr.Zero, IntPtr.Zero, 0),
 			};
 
@@ -190,11 +200,19 @@ internal sealed unsafe class WpeView
 				WpeNative.webkit_web_view_load_uri(_view, initialUri);
 			}
 		}
+		catch (ViewLimitException e)
+		{
+			// no web process for this view: it stays blank until it is released and shown again
+			_failed = true;
+			Failure = e.Message;
+			WpeRuntime.Log("web view refused: " + e.Message);
+		}
 		catch (Exception e)
 		{
 			_failed = true;
 			Failure = e.GetType().Name + ": " + e.Message;
 			WpeRuntime.Log("view creation failed: " + Failure);
+			ReleaseCount();
 		}
 		List<Action> pending;
 		lock (_gate)
@@ -349,6 +367,53 @@ internal sealed unsafe class WpeView
 		{
 			WpeRuntime.Log("load-changed handler: " + e.Message);
 		}
+	}
+
+	private sealed class ViewLimitException(string message) : Exception(message);
+
+	// GLib thread
+	private void ReleaseCount()
+	{
+		if (_counted)
+		{
+			_counted = false;
+			WpeRuntime.ReleaseView();
+		}
+	}
+
+	/// <summary>
+	/// Navigations (links, redirects, forms, new windows) only go to http, https and a few inline schemes; local files
+	/// stay out of reach of web content, except the folders the app maps itself. The address is never logged.
+	/// </summary>
+	private int OnDecidePolicy(IntPtr view, IntPtr decision, int decisionType, IntPtr data)
+	{
+		// WebKitPolicyDecisionType: 0 navigation action, 1 new window action; responses are left to WebKit
+		if (decisionType is not (0 or 1))
+		{
+			return 0;
+		}
+		var scheme = string.Empty;
+		try
+		{
+			var action = WpeNative.webkit_navigation_policy_decision_get_navigation_action(decision);
+			var uri = WpeNative.Utf8(WpeNative.webkit_uri_request_get_uri(WpeNative.webkit_navigation_action_get_request(action)));
+			if (Uri.TryCreate(uri, UriKind.Absolute, out var parsed))
+			{
+				scheme = parsed.Scheme;
+				if (WpeRuntime.IsAllowedScheme(scheme) || (scheme == "file" && WpeRuntime.IsAllowedFile(parsed.LocalPath)))
+				{
+					return 0;
+				}
+			}
+		}
+		catch (Exception e)
+		{
+			WpeRuntime.Log("navigation policy: " + e.Message);
+		}
+		// failing closed: an address that cannot be read is not allowed either
+		WpeRuntime.Log($"navigation blocked (scheme '{(scheme.Length > 16 ? scheme[..16] : scheme)}')");
+		WpeNative.webkit_policy_decision_ignore(decision);
+		return 1;
 	}
 
 	private int OnLoadFailed(IntPtr view, int loadEvent, IntPtr failingUri, IntPtr error, IntPtr data)
@@ -758,6 +823,7 @@ internal sealed unsafe class WpeView
 			_view = IntPtr.Zero;
 			// WebKit may keep the process of a closed view cached: end it, the view is gone for good
 			WpeNative.webkit_web_view_terminate_web_process(view);
+			ReleaseCount();
 			// the rest happens in OnBackendDestroyed, once WebKit is done with the backend (it may still call it now)
 			WpeNative.g_object_unref(view);
 		});
