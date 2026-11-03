@@ -167,6 +167,9 @@ internal sealed unsafe class WpeView
 				WpeRuntime.Log("text input not available: " + e.Message);
 			}
 
+			WpeRuntime.ApplyBackground(_view);
+			WpeRuntime.BackgroundChanged += OnBackgroundChanged;
+
 			var settings = WpeNative.webkit_web_view_get_settings(_view);
 			if (FrameBufferWebView.ApplicationName is { } name)
 			{
@@ -720,6 +723,9 @@ internal sealed unsafe class WpeView
 
 	// ---- end of life -------------------------------------------------------------------------------------------------
 
+	// GLib thread
+	private void OnBackgroundChanged() => WpeRuntime.ApplyBackground(_view);
+
 	/// <summary>Releases the view and its frames. Any thread, once.</summary>
 	public void Dispose()
 	{
@@ -741,6 +747,7 @@ internal sealed unsafe class WpeView
 				FreeNative();
 				return;
 			}
+			WpeRuntime.BackgroundChanged -= OnBackgroundChanged;
 			foreach (var id in _signals)
 			{
 				WpeNative.g_signal_handler_disconnect(_view, id);

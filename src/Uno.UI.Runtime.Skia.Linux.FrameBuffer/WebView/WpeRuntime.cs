@@ -28,6 +28,11 @@ internal static class WpeRuntime
 	private static string? s_failure;
 	// dark mode of the pages: -1 not set, 0 light, 1 dark
 	private static int s_darkMode = -1;
+	// background where a page has not painted yet (ARGB), -1: WebKit's default (white)
+	private static long s_background = -1;
+
+	/// <summary>GLib thread: the background color changed, the views apply it (<see cref="ApplyBackground"/>).</summary>
+	internal static event Action? BackgroundChanged;
 
 	[DllImport("libc", SetLastError = true)]
 	private static extern int setenv(string name, string value, int overwrite);
@@ -79,6 +84,42 @@ internal static class WpeRuntime
 			}
 		}
 		Run(ApplyDarkMode);
+	}
+
+	/// <summary>
+	/// Background of all views where the page has not painted yet: tiles not rendered while scrolling, pages without a
+	/// background. Any thread.
+	/// </summary>
+	public static void SetBackgroundColor(byte a, byte r, byte g, byte b)
+	{
+		Interlocked.Exchange(ref s_background, ((long)a << 24) | ((long)r << 16) | ((long)g << 8) | b);
+		lock (s_gate)
+		{
+			if (!s_ready)
+			{
+				// views apply it when they are created
+				return;
+			}
+		}
+		Run(() => BackgroundChanged?.Invoke());
+	}
+
+	/// <summary>GLib thread: sets the background color on <paramref name="view"/> (WebKitWebView*), if one was set.</summary>
+	internal static void ApplyBackground(IntPtr view)
+	{
+		var argb = Interlocked.Read(ref s_background);
+		if (argb < 0 || view == IntPtr.Zero)
+		{
+			return;
+		}
+		var color = new WpeNative.WebKitColor
+		{
+			Red = ((argb >> 16) & 0xff) / 255.0,
+			Green = ((argb >> 8) & 0xff) / 255.0,
+			Blue = (argb & 0xff) / 255.0,
+			Alpha = ((argb >> 24) & 0xff) / 255.0,
+		};
+		WpeNative.webkit_web_view_set_background_color(view, ref color);
 	}
 
 	// GLib thread

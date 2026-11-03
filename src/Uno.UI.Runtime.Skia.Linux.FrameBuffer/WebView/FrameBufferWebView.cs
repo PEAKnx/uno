@@ -100,6 +100,12 @@ public static class FrameBufferWebView
 	/// <summary>Color scheme of all web pages (CSS <c>prefers-color-scheme</c>, form controls). Any thread.</summary>
 	public static void SetDarkMode(bool dark) => WpeRuntime.SetDarkMode(dark);
 
+	/// <summary>
+	/// Background of all web views where the page has not painted yet (not yet rendered tiles while scrolling, pages
+	/// without a background), as <c>WebView2.DefaultBackgroundColor</c> on Windows. Any thread.
+	/// </summary>
+	public static void SetDefaultBackgroundColor(Windows.UI.Color color) => WpeRuntime.SetBackgroundColor(color.A, color.R, color.G, color.B);
+
 	internal static void RaiseTextInput(FrameBufferWebViewTextInputRequest request) => TextInputRequested?.Invoke(request);
 
 	internal static bool HasTextInputHandler => TextInputRequested is not null;
