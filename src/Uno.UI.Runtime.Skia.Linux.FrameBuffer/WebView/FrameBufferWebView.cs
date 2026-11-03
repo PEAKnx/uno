@@ -109,6 +109,20 @@ public static class FrameBufferWebView
 	/// </summary>
 	public static void SetDefaultBackgroundColor(Windows.UI.Color color) => WpeRuntime.SetBackgroundColor(color.A, color.R, color.G, color.B);
 
+	/// <summary>
+	/// Number of web views that may be live at once, from the RAM of the device (each has its own web process).
+	/// </summary>
+	public static int MaxLiveViews => WpeRuntime.MaxLiveViews;
+
+	/// <summary>
+	/// Raised on the UI thread when a web view cannot be created because <see cref="MaxLiveViews"/> views are live: the
+	/// view stays blank, the app shows a message in its widget. Arguments: the <see cref="CoreWebView2"/> of the view and
+	/// the limit.
+	/// </summary>
+	public static event Action<CoreWebView2, int>? ViewRefused;
+
+	internal static void RaiseViewRefused(CoreWebView2 coreWebView2, int limit) => ViewRefused?.Invoke(coreWebView2, limit);
+
 	internal static void RaiseTextInput(FrameBufferWebViewTextInputRequest request) => TextInputRequested?.Invoke(request);
 
 	internal static bool HasTextInputHandler => TextInputRequested is not null;

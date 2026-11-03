@@ -69,6 +69,8 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 		var weak = new WeakReference<WpeNativeWebView>(this);
 		view.NavigationStarted += u => { if (weak.TryGetTarget(out var t)) t.OnNavigationStarted(u); };
 		view.NavigationFinished += (u, ok, back, fwd) => { if (weak.TryGetTarget(out var t)) t.OnNavigationFinished(u, ok, back, fwd); };
+		// the app shows a message in the widget: a blank widget would not be understood
+		view.Refused += () => { if (weak.TryGetTarget(out var t)) t._dispatcher.TryEnqueue(() => FrameBufferWebView.RaiseViewRefused(t._coreWebView, WpeRuntime.MaxLiveViews)); };
 		view.TitleChanged += () => { if (weak.TryGetTarget(out var t)) t._dispatcher.TryEnqueue(t._coreWebView.OnDocumentTitleChanged); };
 		view.TextInputFocus += (f, p, h) => { if (weak.TryGetTarget(out var t)) t.OnTextInputFocus(f, p, h); };
 		view.TextInputSurrounding += value => { if (weak.TryGetTarget(out var t)) t._lastFocusValue = value; };

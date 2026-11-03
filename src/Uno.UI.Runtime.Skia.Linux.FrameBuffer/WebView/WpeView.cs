@@ -72,6 +72,9 @@ internal sealed unsafe class WpeView
 	/// <summary>GLib thread: a navigation finished (uri, success, canGoBack, canGoForward).</summary>
 	public event Action<string, bool, bool, bool>? NavigationFinished;
 
+	/// <summary>GLib thread: no web process for this view, the limit of live views is reached (the view stays blank).</summary>
+	public event Action? Refused;
+
 	/// <summary>GLib thread: the document title changed.</summary>
 	public event Action? TitleChanged;
 
@@ -206,6 +209,7 @@ internal sealed unsafe class WpeView
 			_failed = true;
 			Failure = e.Message;
 			WpeRuntime.Log("web view refused: " + e.Message);
+			Refused?.Invoke();
 		}
 		catch (Exception e)
 		{

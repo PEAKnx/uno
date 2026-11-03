@@ -33,20 +33,20 @@ internal static class WpeRuntime
 	private static int s_liveViews;
 
 	// Every live view has its own web process: 150-170 MB RSS (ADR 0001 section 10). The views may use this share of
-	// the RAM; 4 GB devices get 4 views, 2 GB devices 2.
-	private const int ViewRamPercent = 20;
+	// the RAM; 4 GB devices get 6 views, 2 GB devices 3.
+	private const int ViewRamPercent = 30;
 	private const int ViewRamMb = 170;
 	private const int MaxLiveViewsCap = 8;
 
 	/// <summary>
 	/// Number of web views that may be live at once (a web process each), from the RAM of the device. The environment
-	/// variable <c>UNO_FRAMEBUFFER_WEBVIEW_MAX</c> overrides it.
+	/// variable <c>UNO_FRAMEBUFFER_WEBVIEW_MAX</c> overrides it (0 refuses every view: to see the message of the app).
 	/// </summary>
 	public static int MaxLiveViews { get; } = ComputeMaxLiveViews();
 
 	private static int ComputeMaxLiveViews()
 	{
-		if (int.TryParse(Environment.GetEnvironmentVariable("UNO_FRAMEBUFFER_WEBVIEW_MAX"), out var forced) && forced >= 1)
+		if (int.TryParse(Environment.GetEnvironmentVariable("UNO_FRAMEBUFFER_WEBVIEW_MAX"), out var forced) && forced >= 0)
 		{
 			return forced;
 		}
