@@ -97,6 +97,9 @@ public static class FrameBufferWebView
 	/// <summary>Raised on the UI thread when a page starts editing text. See <see cref="FrameBufferWebViewTextInputRequest"/>.</summary>
 	public static event Action<FrameBufferWebViewTextInputRequest>? TextInputRequested;
 
+	/// <summary>Color scheme of all web pages (CSS <c>prefers-color-scheme</c>, form controls). Any thread.</summary>
+	public static void SetDarkMode(bool dark) => WpeRuntime.SetDarkMode(dark);
+
 	internal static void RaiseTextInput(FrameBufferWebViewTextInputRequest request) => TextInputRequested?.Invoke(request);
 
 	internal static bool HasTextInputHandler => TextInputRequested is not null;

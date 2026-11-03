@@ -26,6 +26,8 @@ internal static class WpeRuntime
 	private static volatile bool s_ready;
 	private static IntPtr s_context;
 	private static string? s_failure;
+	// dark mode of the pages: -1 not set, 0 light, 1 dark
+	private static int s_darkMode = -1;
 
 	[DllImport("libc", SetLastError = true)]
 	private static extern int setenv(string name, string value, int overwrite);
@@ -61,6 +63,41 @@ internal static class WpeRuntime
 
 	/// <summary>Why the runtime failed to start (null while it is running or not started).</summary>
 	public static string? Failure => s_failure;
+
+	/// <summary>
+	/// Color scheme of all pages (<c>prefers-color-scheme</c>). Any thread; applied when the runtime starts, so the call
+	/// does not start WebKit by itself.
+	/// </summary>
+	public static void SetDarkMode(bool dark)
+	{
+		Interlocked.Exchange(ref s_darkMode, dark ? 1 : 0);
+		lock (s_gate)
+		{
+			if (!s_starting && !s_ready)
+			{
+				return;
+			}
+		}
+		Run(ApplyDarkMode);
+	}
+
+	// GLib thread
+	private static void ApplyDarkMode()
+	{
+		var dark = Volatile.Read(ref s_darkMode);
+		if (dark < 0)
+		{
+			return;
+		}
+		try
+		{
+			WpeNative.webkit_pnx_set_dark_mode(dark);
+		}
+		catch (EntryPointNotFoundException)
+		{
+			Log("dark mode not supported by this WPE WebKit (BSP patch missing): pages keep their default scheme");
+		}
+	}
 
 	/// <summary>
 	/// Runs <paramref name="action"/> on the GLib thread, as soon as the runtime is up. Starts the runtime on the first call:
@@ -121,6 +158,8 @@ internal static class WpeRuntime
 					// web views still work, with cookies in memory
 					Log("persistent cookies not available: " + e.Message);
 				}
+				// before the first view: its page starts with the scheme
+				ApplyDarkMode();
 				List<Action> early;
 				lock (s_gate)
 				{

@@ -87,6 +87,8 @@ internal static unsafe class WpeNative
 	[DllImport(Web)] public static extern IntPtr webkit_web_view_get_settings(IntPtr view);
 	[DllImport(Web)] public static extern void webkit_settings_set_user_agent_with_application_details(IntPtr settings, [MarshalAs(UnmanagedType.LPStr)] string? name, [MarshalAs(UnmanagedType.LPStr)] string? version);
 	[DllImport(Web)] public static extern void webkit_settings_set_enable_developer_extras(IntPtr settings, int enabled);
+	// PEAKnx WebKit patch (BSP board/common/patches/wpewebkit): dark mode of the libwpe views
+	[DllImport(Web)] public static extern void webkit_pnx_set_dark_mode(int dark);
 	[DllImport(Web)] public static extern IntPtr webkit_network_session_get_default();
 	[DllImport(Web)] public static extern IntPtr webkit_network_session_get_cookie_manager(IntPtr session);
 	[DllImport(Web)] public static extern IntPtr webkit_network_session_get_website_data_manager(IntPtr session);
