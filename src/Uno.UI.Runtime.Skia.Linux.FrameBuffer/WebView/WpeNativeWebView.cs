@@ -33,16 +33,11 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 	private readonly CoreWebView2 _coreWebView;
 	private readonly ContentPresenter _presenter;
 	private readonly DispatcherQueue _dispatcher;
-	// an unloaded view gives its web process back after this time; shown again, it is created anew (history is lost)
-	private static readonly TimeSpan ReleaseDelay = TimeSpan.FromSeconds(10);
 	// a text focus this soon after a press or release on the view counts as the user's: the keyboard opens
 	private const long UserFocusWindowMs = 1500;
 
 	private readonly WpeCanvasElement _canvas;
 	private WpeView _view;
-	private bool _released;
-	private string? _lastUri; // never logged: may carry credentials
-	private DispatcherQueueTimer? _releaseTimer;
 	private bool _dontRaiseNextNavigationCompleted;
 	private bool _scrollingEnabled = true;
 	private string? _lastFocusValue;
@@ -54,17 +49,17 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 		_coreWebView = coreWebView2;
 		_presenter = presenter;
 		_dispatcher = presenter.DispatcherQueue;
-		_view = CreateView(null);
+		_view = CreateView();
 		_canvas = new WpeCanvasElement(_view);
 		presenter.Content = _canvas;
 	}
 
 	~WpeNativeWebView() => _view.Dispose();
 
-	private WpeView CreateView(string? uri)
+	private WpeView CreateView()
 	{
 		// the scale is known here: WebKit does not pick up a later change of the device scale factor reliably
-		var view = new WpeView(800, 600, (float)(_presenter.XamlRoot?.RasterizationScale ?? 1), uri);
+		var view = new WpeView(800, 600, (float)(_presenter.XamlRoot?.RasterizationScale ?? 1), null);
 		// weak: the view lives until it is disposed, the finalizer of this object disposes it
 		var weak = new WeakReference<WpeNativeWebView>(this);
 		view.NavigationStarted += u => { if (weak.TryGetTarget(out var t)) t.OnNavigationStarted(u); };
@@ -77,31 +72,13 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 		return view;
 	}
 
-	/// <summary>The live view; a released one is created again with the last address (UI thread).</summary>
-	private WpeView View
-	{
-		get
-		{
-			if (_released)
-			{
-				_released = false;
-				_view = CreateView(_lastUri);
-				_canvas.SetView(_view);
-			}
-			return _view;
-		}
-	}
-
 	public string DocumentTitle => _view.Title;
 
-	public void OnLoaded()
-	{
-		_releaseTimer?.Stop();
-		View.SetVisible(true);
-	}
+	public void OnLoaded() => _view.SetVisible(true);
 
 	public void OnUnloaded()
 	{
+		// the view stays alive (the app owns its lifetime and frees it by dropping the web view): only hidden
 		_view.SetVisible(false);
 		if (_openRequest is not null)
 		{
@@ -111,39 +88,15 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 			_openRequest = null;
 			_view.Blur();
 		}
-		if (_released)
-		{
-			return;
-		}
-		if (_releaseTimer is null)
-		{
-			_releaseTimer = _dispatcher.CreateTimer();
-			_releaseTimer.IsRepeating = false;
-			_releaseTimer.Interval = ReleaseDelay;
-			_releaseTimer.Tick += (_, _) => Release();
-		}
-		_releaseTimer.Start();
 	}
 
-	// RAM: each view has its own web process (about 110 MB); an unloaded one (page left, fullscreen closed) frees it
-	private void Release()
-	{
-		if (_released || _presenter.IsLoaded)
-		{
-			return;
-		}
-		_released = true;
-		_view.Dispose();
-		WpeRuntime.Log("unloaded view released");
-	}
+	public void GoBack() => _view.GoBack();
 
-	public void GoBack() => View.GoBack();
+	public void GoForward() => _view.GoForward();
 
-	public void GoForward() => View.GoForward();
+	public void Stop() => _view.Stop();
 
-	public void Stop() => View.Stop();
-
-	public void Reload() => View.Reload();
+	public void Reload() => _view.Reload();
 
 	public void ProcessNavigation(Uri uri)
 	{
@@ -151,15 +104,15 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 		{
 			// the only place pages may reach local files: the folders the app maps itself
 			WpeRuntime.AllowFolder(Path.Join(Package.Current.InstalledPath, folderName));
-			View.Load($"file://{Path.Join(Package.Current.InstalledPath, folderName, uri.PathAndQuery)}");
+			_view.Load($"file://{Path.Join(Package.Current.InstalledPath, folderName, uri.PathAndQuery)}");
 		}
 		else
 		{
-			View.Load(uri.ToString());
+			_view.Load(uri.ToString());
 		}
 	}
 
-	public void ProcessNavigation(string html) => View.LoadHtml(html);
+	public void ProcessNavigation(string html) => _view.LoadHtml(html);
 
 	public void ProcessNavigation(HttpRequestMessage httpRequestMessage)
 	{
@@ -176,10 +129,10 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 		{
 			this.Log().Warn($"Only GET is supported, {httpRequestMessage.Method} was sent as GET.");
 		}
-		View.LoadRequest(uri, httpRequestMessage);
+		_view.LoadRequest(uri, httpRequestMessage);
 	}
 
-	public Task<string?> ExecuteScriptAsync(string script, CancellationToken token) => View.ExecuteScriptAsync(script);
+	public Task<string?> ExecuteScriptAsync(string script, CancellationToken token) => _view.ExecuteScriptAsync(script);
 
 	public Task<string?> InvokeScriptAsync(string script, string[]? arguments, CancellationToken token)
 	{
@@ -220,10 +173,6 @@ internal sealed class WpeNativeWebView : ICleanableNativeWebView
 
 	private void OnNavigationFinished(string uriString, bool success, bool canGoBack, bool canGoForward)
 	{
-		if (success && uriString.Length > 0)
-		{
-			_lastUri = uriString;
-		}
 		if (!success)
 		{
 			_dontRaiseNextNavigationCompleted = true;

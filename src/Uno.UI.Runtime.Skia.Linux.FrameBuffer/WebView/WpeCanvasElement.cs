@@ -44,14 +44,6 @@ internal sealed class WpeCanvasElement : SKCanvasElement
 		PointerWheelChanged += OnWheel;
 	}
 
-	/// <summary>Shows another view (a released view was created again).</summary>
-	public void SetView(WpeView view)
-	{
-		_view = view;
-		Subscribe(view);
-		Invalidate();
-	}
-
 	private void Subscribe(WpeView view)
 	{
 		var weak = new WeakReference<WpeCanvasElement>(this);
