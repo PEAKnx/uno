@@ -54,11 +54,38 @@ internal sealed class WpeCanvasElement : SKCanvasElement
 	{
 		_scale = XamlRoot?.RasterizationScale ?? _scale;
 		// logical (DIP) size: the device scale factor is set separately
-		_view.SetSize((uint)Math.Max(1, area.Width), (uint)Math.Max(1, area.Height), (float)_scale);
+		var width = (uint)Math.Max(1, area.Width);
+		var height = (uint)Math.Max(1, area.Height);
+		_view.SetSize(width, height, (float)_scale);
 		if (_view.Image is { } image)
 		{
-			canvas.DrawImage(image, new SKRect(0, 0, (float)area.Width, (float)area.Height), new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.None));
+			// After a resize the newest frame still has the old size and would be drawn stretched: draw nothing until the engine
+			// delivers a frame in the new size (frame size = view size x scale). Safety net: draw it after a while anyway.
+			var matches = Math.Abs(image.Width - width * _scale) <= 2 && Math.Abs(image.Height - height * _scale) <= 2;
+			if (matches)
+			{
+				_mismatchSince = 0;
+			}
+			else if (_mismatchSince == 0)
+			{
+				_mismatchSince = Environment.TickCount64;
+				DispatcherQueue?.TryEnqueue(() => _ = RedrawAfterGraceAsync());
+			}
+			if (matches || Environment.TickCount64 - _mismatchSince > MismatchGraceMs)
+			{
+				canvas.DrawImage(image, new SKRect(0, 0, (float)area.Width, (float)area.Height), new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.None));
+			}
 		}
+	}
+
+	private const long MismatchGraceMs = 1000;
+	private long _mismatchSince;
+
+	// The canvas only redraws on a new frame: a single wake-up makes sure the safety net draws even if the engine stays silent
+	private async System.Threading.Tasks.Task RedrawAfterGraceAsync()
+	{
+		await System.Threading.Tasks.Task.Delay((int)MismatchGraceMs + 50);
+		Invalidate();
 	}
 
 	private void OnPointer(PointerRoutedEventArgs e, int phase)
